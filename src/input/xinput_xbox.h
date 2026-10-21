@@ -109,6 +109,23 @@ BOOL xbox_InputIsConnected(DWORD dwPort);
  */
 DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILITIES *pCaps);
 
+/**
+ * Refresh every port's cached state from the host input backend.
+ *
+ * On POSIX this also runs the controller update and rescans for pads (the
+ * hot-plug path when there is no SDL window pumping events). Returns a
+ * bitmask of the ports that produced a report, bit 0 = port 0. A background
+ * thread calls this at 60 Hz once the layer is initialized; the USB pad
+ * bridge may also call it, or read the cache with xbox_InputPadSnapshot.
+ */
+int xbox_InputPadRefresh(void);
+
+/**
+ * Copy the state xbox_InputPadRefresh last stored for a port. Returns TRUE
+ * for a valid port even if nothing was ever connected (the state is zero).
+ */
+BOOL xbox_InputPadSnapshot(DWORD dwPort, XBOX_INPUT_STATE *pState);
+
 #ifdef __cplusplus
 }
 #endif

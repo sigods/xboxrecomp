@@ -569,11 +569,46 @@ static int fetch_attr(const VertexAttr *a, uint32_t index, float out[4])
             return 0;
         p = (const uint8_t *)s_gpu.inline_buf + at;
     } else {
-        uint64_t at = (uint64_t)a->offset + (uint64_t)index * a->stride;
+        /* The offset names bytes inside the vertex DMA object, so it is a
+         * physical address, not a guest VA -- the same distinction the clear
+         * and draw paths already make. A buffer the title got from
+         * MmAllocateContiguousMemory is only reachable through the window;
+         * reading it at the plain offset returns whatever else lives there,
+         * which decodes to identical vertices and therefore to triangles with
+         * zero area. */
+        uint32_t at = a->offset + (uint32_t)index * a->stride;
+        uint32_t addr = dma_resolve(at);
 
-        if (!a->offset || !guest_span_ok(at, attr_elem_bytes(a)))
+        /* Validate the address the read will actually use. The raw offset is
+         * a physical address inside the vertex DMA object and is not a guest
+         * address at all, so checking it rejects every buffer the title got
+         * from MmAllocateContiguousMemory -- and a rejected attribute makes
+         * batch_is_screen_space() call the whole batch untransformed. */
+        if (!a->offset || !guest_span_ok(addr, attr_elem_bytes(a)))
             return 0;
-        p = mem + at;
+        p = mem + addr;
+    }
+
+    {
+        static int vtx_dump = -1;
+        if (vtx_dump < 0)
+            vtx_dump = getenv("RECOMP_VTX_DUMP") != NULL;
+        if (vtx_dump && index == 0 && s_gpu.batches_program < 3) {
+            const uint32_t *w32 = (const uint32_t *)p;
+            fprintf(stderr, "  [VTX] b=%u type=%u size=%u stride=%u off=0x%X "
+                            "raw=%08X %08X %08X %08X %08X %08X %08X %08X\n",
+                    s_gpu.batches_program, a->type, a->size, a->stride,
+                    a->offset, w32[0], w32[1], w32[2], w32[3],
+                    w32[4], w32[5], w32[6], w32[7]);
+            if (a->type == 2 && a->size == 4 && a->stride) {
+                int k;
+                for (k = 1; k < 4; k++) {
+                    const float *q = (const float *)(p + (size_t)k * a->stride);
+                    fprintf(stderr, "  [VTX]   v%d = %.3f %.3f %.3f %.3f\n",
+                            k, q[0], q[1], q[2], q[3]);
+                }
+            }
+        }
     }
 
     switch (a->type) {
@@ -589,6 +624,16 @@ static int fetch_attr(const VertexAttr *a, uint32_t index, float out[4])
     case 2:                                  /* float */
         for (i = 0; i < a->size && i < 4; i++)
             out[i] = ((const float *)p)[i];
+        /* Screen-space quads: the title leaves the fourth component of its
+         * position at zero and its own vertex program inverts it (`rcp`).
+         * A zero would make that infinite and every vertex would be rejected
+         * by the non-finite guard, yet the same title stores a real w on 3D
+         * vertices -- so the zero is a 2D-path convention, not data the
+         * program can consume. Supply the homogeneous 1.0 the program assumes.
+         * Only the position attribute is corrected: other float4 attributes
+         * keep exactly what the buffer holds. */
+        if (a == &s_gpu.attr[0] && a->size == 4 && out[3] == 0.0f)
+            out[3] = 1.0f;
         return 1;
     case 4:                                  /* unsigned byte, normalised */
         for (i = 0; i < a->size && i < 4; i++)
@@ -1482,7 +1527,6 @@ static void put_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb)
     if (s_swz_on && ((uint32_t)x >> ((s_gpu.format >> 16) & 0xF)
                      || (uint32_t)y >> ((s_gpu.format >> 24) & 0xF)))
         return;
-    s_gpu.pixels++;
     if ((argb & 0x00FFFFFFu) > (s_gpu.pixel_max & 0x00FFFFFFu))
         s_gpu.pixel_max = argb;
     xi = surface_index(x, y, &row);
@@ -2993,7 +3037,7 @@ static void raster_batch_program(void)
         }
         /* Spread out: one every 20000 program batches, so a run that spends
          * its first half in menus still traces the 3D scene. */
-        if (left > 0 && n >= 3 && s_gpu.batches_program % 20000 == 0) {
+        if (left > 0 && n >= 3 && (s_gpu.batches_program % 20000 == 0)) {
             float in[4];
             left--;
             fprintf(stderr, "[VTRACE] prim %u n %u idx %u %u %u\n", s_gpu.prim,

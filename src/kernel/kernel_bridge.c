@@ -1,3 +1,4 @@
+#define _GNU_SOURCE 1
 /**
  * kernel_bridge.c - Bridge between translated game code and kernel functions
  *
@@ -25,12 +26,16 @@
  *   different parameter layouts (pointer vs value), so each needs its own bridge.
  */
 
+#ifndef _WIN32
+#include <dlfcn.h>
+#endif
 #include "kernel.h"
 #include "guest_vmem.h"
 #include "kernel_missing.h"
 #include "xbox_memory_layout.h"
 #include "platform/host_time.h"
 #include "recomp_icall_feedback.h"
+#include "usb/ohci.h"
 #include <stdio.h>
 /* stdlib.h is load-bearing, not tidiness. Without it C89 implicit declaration
  * makes malloc return `int`, so bridge_spawn_thread truncated its heap pointer
@@ -69,6 +74,12 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
 
 /* Translate Xbox VA to native pointer (NULL-safe: 0 → NULL) */
 #define XBOX_TO_NATIVE(va) ((va) ? (void*)((uintptr_t)(va) + g_xbox_mem_offset) : NULL)
+
+/* Handle-table token markers. Defined here because the sync-object resolver
+ * below has to tell a tagged token (or a pseudo-handle) from a guest VA. */
+#define BRIDGE_HANDLE_TAG  0x48000000u
+#define BRIDGE_HANDLE_MASK 0x00FFFFFFu
+#define BRIDGE_HANDLE_MAX  16384
 
 /* ── Guest buffers the host is about to touch ───────────
  *
@@ -1984,6 +1995,82 @@ static HANDLE ke_shadow_lookup(uint32_t guest_va);
 static void ke_shadow_insert(uint32_t guest_va, HANDLE host);
 static HANDLE bridge_resolve_handle(uint32_t token);
 static HANDLE ke_guest_event(uint32_t guest_va, int *type);
+static HANDLE ke_guest_event_prepare(uint32_t guest_va, int *type);
+
+/* Per-title opt-in for KEVENTs the title builds by writing the dispatcher
+ * header itself (see ke_guest_event). Default off; RECOMP_TITLE_KEVENTS=1
+ * still works for titles that cannot call this before xbox_kernel_init(). */
+static int g_title_kevents = -1;   /* -1: env not consulted yet */
+
+void xbox_EnableTitleEvents(int enable)
+{
+    g_title_kevents = enable ? 1 : 0;
+}
+
+static int title_kevents_enabled(void)
+{
+    if (g_title_kevents < 0) {
+        const char *e = getenv("RECOMP_TITLE_KEVENTS");
+        g_title_kevents = e && *e == '1';
+    }
+    return g_title_kevents;
+}
+
+/* Resolve a guest object argument to a host sync object.
+ *
+ * The old fallback passed an untagged guest VA straight to Win32 as a HANDLE.
+ * A KEVENT the title embedded in its D3D device (at device+0x199C) then
+ * reached WaitForSingleObject as 0x0010668C and faulted inside the emulated
+ * wait. Only title-built events, an existing shadow, or a real tagged/
+ * pseudo-handle may cross into a host call; anything else is unresolved. */
+static HANDLE ke_resolve_sync_object(uint32_t guest_va, int for_wait)
+{
+    int type = 0;
+    HANDLE h = for_wait ? ke_guest_event_prepare(guest_va, &type)
+                        : ke_guest_event(guest_va, &type);
+    if (h)
+        return h;
+    h = ke_shadow_lookup(guest_va);
+    if (h)
+        return h;
+    if ((guest_va & 0xFF000000u) == BRIDGE_HANDLE_TAG
+            || guest_va >= 0xFFFFFFF0u)
+        return bridge_resolve_handle(guest_va);
+    return NULL;
+}
+
+/* Unresolved objects are expected until the title has built the object, so
+ * cap the noise but keep the evidence. */
+static void ke_log_unresolved(const char *fn, uint32_t guest_va)
+{
+    static int shown;
+    if (shown < 8) {
+        shown++;
+        fprintf(stderr, "  [KERNEL] %s: unresolved guest object 0x%08X "
+                        "(no event/shadow/handle)\n", fn, guest_va);
+    }
+}
+
+/* Signal a KEVENT the title built in guest memory. The fence mirror runs on
+ * its own thread, so this goes through the shadow table's lock and uses the
+ * same resolver every other bridge uses; SetEvent itself is thread-safe. */
+void xbox_KeSetGuestEvent(uint32_t guest_va)
+{
+    int type = 0;
+    HANDLE h = ke_guest_event(guest_va, &type);
+    if (!h) {
+        h = ke_shadow_lookup(guest_va);
+        if (!h && ((guest_va & 0xFF000000u) == BRIDGE_HANDLE_TAG
+                   || guest_va >= 0xFFFFFFF0u))
+            h = bridge_resolve_handle(guest_va);
+    }
+    if (!h) {
+        ke_log_unresolved("xbox_KeSetGuestEvent", guest_va);
+        return;
+    }
+    BRIDGE_MEM32(guest_va + 4) = 1;   /* SignalState */
+    SetEvent(h);
+}
 
 /* Bring a header-owned host event in line with guest SignalState before a
  * wait. Explicitly initialized shadows keep their existing host-state policy. */
@@ -2023,20 +2110,63 @@ static void bridge_KeSetEvent(void)
             return;
         }
     }
-    h = ke_shadow_lookup(guest_va);
-    if (!h)
-        h = bridge_resolve_handle(guest_va);
-    if (!h)
-        h = XBOX_TO_NATIVE(guest_va);
-    if (h)
-        g_eax = (uint32_t)SetEvent(h);
-    else
+    h = ke_resolve_sync_object(guest_va, 0);
+    if (!h) {
+        /* No-op: never hand an unresolved guest VA to SetEvent. */
+        ke_log_unresolved("KeSetEvent", guest_va);
         g_eax = 0;
+        return;
+    }
+    g_eax = (uint32_t)SetEvent(h);
 }
 
 /* ── KeWaitForSingleObject (ordinal 159) ─────────────────── */
+/* ── diagnostic: bounded guest waits ───────────────────────────────────────
+ * A wait on an object nothing ever signals deadlocks the title silently: the
+ * process just sits at 100% CPU (or blocks) and the log goes quiet. With
+ * RECOMP_WAIT_TIMEOUT_MS set, every wait longer than that (including the
+ * NULL/infinite form) is capped, logged once per object, and returns
+ * STATUS_TIMEOUT instead of wedging the run. Diagnostic only.
+ */
+static PLARGE_INTEGER bridge_wait_timeout(uint32_t timeout_ptr, const char *api,
+                                          uint32_t object, PLARGE_INTEGER scratch)
+{
+    static int cap_ms = -1;
+    static unsigned logged;
+    PLARGE_INTEGER li = (PLARGE_INTEGER)XBOX_TO_NATIVE(timeout_ptr);
+    long long ms;
+
+    if (cap_ms < 0) {
+        const char *e = getenv("RECOMP_WAIT_TIMEOUT_MS");
+        cap_ms = e ? atoi(e) : 0;
+    }
+    if (cap_ms <= 0)
+        return li;
+
+    if (!li) {
+        ms = -1;                                   /* infinite */
+    } else {
+        long long ticks = (long long)li->QuadPart;
+        if (ticks == 0)
+            return li;                             /* polling, leave alone */
+        ms = (ticks < 0 ? -ticks : ticks) / 10000;  /* 100ns -> ms */
+        if (ms <= cap_ms)
+            return li;
+    }
+
+    if (logged < 8) {
+        logged++;
+        fprintf(stderr,
+                "[bridge] %s object 0x%08X: wait %lldms capped to %dms "
+                "(RECOMP_WAIT_TIMEOUT_MS)\n", api, object, ms, cap_ms);
+    }
+    scratch->QuadPart = (LONGLONG)cap_ms * 10000;
+    return scratch;
+}
+
 static void bridge_KeWaitForSingleObject(void)
 {
+    LARGE_INTEGER capped;
     uint32_t object = STACK_ARG(0);
     uint32_t wait_reason = STACK_ARG(1);
     uint32_t wait_mode = STACK_ARG(2);
@@ -2051,23 +2181,27 @@ static void bridge_KeWaitForSingleObject(void)
         HANDLE ge = ke_guest_event_prepare(object, &type);
         if (ge) {
             g_eax = (uint32_t)xbox_KeWaitForSingleObject(
-                ge, wait_reason, wait_mode,
-                (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
+                ge, wait_reason, wait_mode, (BOOLEAN)alertable,
+                bridge_wait_timeout(timeout_ptr, "KeWaitForSingleObject", object, &capped));
             if (g_eax == 0 && type == 1)               /* synchronization: consumed */
                 BRIDGE_MEM32(object + 4) = 0;
             return;
         }
     }
 
-    h = ke_shadow_lookup(object);
-    if (!h)
-        h = bridge_resolve_handle(object);
-    if (!h)
-        h = XBOX_TO_NATIVE(object);
+    h = ke_resolve_sync_object(object, 1);
+    if (!h) {
+        /* An unresolved object is not a HANDLE. Returning "success" here made
+         * callers carry on as if the wait had completed; reporting an invalid
+         * handle is what the kernel would do. */
+        ke_log_unresolved("KeWaitForSingleObject", object);
+        g_eax = 0xC0000008u;   /* STATUS_INVALID_HANDLE */
+        return;
+    }
 
     g_eax = (uint32_t)xbox_KeWaitForSingleObject(
-        h, wait_reason, wait_mode,
-        (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
+        h, wait_reason, wait_mode, (BOOLEAN)alertable,
+        bridge_wait_timeout(timeout_ptr, "KeWaitForSingleObject", object, &capped));
 }
 
 /* ── NtWaitForSingleObject (ordinal 233) ─────────────────── */
@@ -2079,6 +2213,7 @@ static void bridge_KeWaitForSingleObject(void)
  */
 static void bridge_NtWaitForSingleObject(void)
 {
+    LARGE_INTEGER capped;
     HANDLE   handle      = bridge_resolve_handle(STACK_ARG(0));
     uint32_t alertable   = STACK_ARG(1);
     uint32_t timeout_ptr = STACK_ARG(2);
@@ -2086,7 +2221,8 @@ static void bridge_NtWaitForSingleObject(void)
     if (bridge_run_io_apcs(alertable, 1))
         return;
     g_eax = (uint32_t)xbox_NtWaitForSingleObject(
-        handle, (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
+        handle, (BOOLEAN)alertable,
+        bridge_wait_timeout(timeout_ptr, "NtWaitForSingleObject", STACK_ARG(0), &capped));
 }
 
 /* ── NtClearEvent (ordinal 186) ──────────────────────────── */
@@ -3995,10 +4131,8 @@ static void bridge_write_iostatus(uint32_t ios_va, NTSTATUS status, uint32_t inf
  * Xbox memory. Tokens carry a tag in the high byte so they never collide
  * with the synthetic handles (0xDEAD0001 / 0xBEEF0010) used elsewhere.
  */
-#define BRIDGE_HANDLE_TAG  0x48000000u
-#define BRIDGE_HANDLE_MASK 0x00FFFFFFu
-#define BRIDGE_HANDLE_MAX  16384
-/* thobj_* above spell these out because it comes first. */
+/* The tag/mask/max are defined near XBOX_TO_NATIVE above; thobj_* above
+ * spells them out because it comes first. */
 typedef char thobj_tag_matches[(BRIDGE_HANDLE_TAG == 0x48000000u &&
                                 BRIDGE_HANDLE_MAX == 16384) ? 1 : -1];
 static HANDLE s_handle_table[BRIDGE_HANDLE_MAX];
@@ -4709,13 +4843,15 @@ static int bridge_handle_is_async(uint32_t token)
     return 0;
 }
 
-/* Off unless RECOMP_ASYNC_IO is set, so the two behaviours stay comparable
- * rather than one being swapped in blind. */
+/* Asynchronous completion is the default: the title's streamed-BGM loop and
+ * the XMV demux only consume a buffer when NtReadFile reports STATUS_PENDING,
+ * so completing inline leaves them reading headers forever. RECOMP_SYNC_IO
+ * keeps the old behaviour available for comparison. */
 static int bridge_async_io_enabled(void)
 {
     static int on = -1;
     if (on < 0)
-        on = getenv("RECOMP_ASYNC_IO") ? 1 : 0;
+        on = getenv("RECOMP_SYNC_IO") ? 0 : 1;
     return on;
 }
 
@@ -5141,6 +5277,57 @@ static void bridge_NtDeviceIoControlFile(void)
          *   6 CdbLength  7 SenseInfoLength  8 DataIn
          *   12 DataTransferLength  16 TimeOutValue  20 DataBuffer
          *   24 SenseInfoOffset  28 Cdb[16] */
+        /* 0xAD READ DVD STRUCTURE -- the security-sector read behind the
+         * media check. Serve the sector from SS.bin (or $XBOX_DVD_SS); a
+         * trimmed image has no signed sector, so this is zeros and the
+         * title's own signature check rejects it (see the manual override
+         * of guest 0x000E5666). */
+        if (in_va && in_len >= 44 && BRIDGE_MEM8(in_va + 28) == 0xAD) {
+            static uint8_t ss[2048];
+            static int ss_state;         /* 0 unloaded, 1 zeros, 2 file */
+            uint32_t data_va  = BRIDGE_MEM32(in_va + 20);
+            uint32_t data_len = BRIDGE_MEM32(in_va + 12);
+            uint32_t n, i;
+
+            if (!ss_state) {
+                const char *path = getenv("XBOX_DVD_SS");
+                FILE *f;
+                if (!path || !*path)
+                    path = "SS.bin";
+                f = fopen(path, "rb");
+                if (f) {
+                    if (fread(ss, 1, sizeof ss, f) == sizeof ss)
+                        ss_state = 2;
+                    fclose(f);
+                }
+                if (!ss_state)
+                    ss_state = 1;
+                fprintf(stderr, "  [FILE] DVD READ STRUCTURE: security sector %s\n",
+                        ss_state == 2 ? "loaded from file" : "absent (zeros)");
+            }
+
+            n = data_len < sizeof ss ? data_len : (uint32_t)sizeof ss;
+            if (data_va) {
+                for (i = 0; i < n; i++)
+                    BRIDGE_MEM8(data_va + i) = ss[i];
+                for (; i < data_len; i++)
+                    BRIDGE_MEM8(data_va + i) = 0;
+            }
+            fprintf(stderr, "  [FILE] DVD READ STRUCTURE cdb %02X %02X %02X %02X "
+                            "%02X %02X %02X %02X %02X %02X %02X %02X -> %u bytes\n",
+                    BRIDGE_MEM8(in_va + 28), BRIDGE_MEM8(in_va + 29),
+                    BRIDGE_MEM8(in_va + 30), BRIDGE_MEM8(in_va + 31),
+                    BRIDGE_MEM8(in_va + 32), BRIDGE_MEM8(in_va + 33),
+                    BRIDGE_MEM8(in_va + 34), BRIDGE_MEM8(in_va + 35),
+                    BRIDGE_MEM8(in_va + 36), BRIDGE_MEM8(in_va + 37),
+                    BRIDGE_MEM8(in_va + 38), BRIDGE_MEM8(in_va + 39),
+                    n);
+            BRIDGE_MEM8(in_va + 2) = 0;              /* ScsiStatus = GOOD */
+            bridge_write_iostatus(ios_va, 0, in_len);
+            g_eax = 0;
+            return;
+        }
+
         if (in_va && in_len >= 44 && BRIDGE_MEM8(in_va + 28) == 0x5A) {
             uint32_t data_va  = BRIDGE_MEM32(in_va + 20);
             uint32_t data_len = BRIDGE_MEM32(in_va + 12);
@@ -7628,15 +7815,10 @@ static void ke_shadow_remove(uint32_t guest_va)
  * hang. Turn it on for a title that waits on events it built itself. */
 static HANDLE ke_guest_event(uint32_t guest_va, int *type)
 {
-    static int enabled = -1;
     uint32_t hdr, i;
     HANDLE h = NULL;
 
-    if (enabled < 0) {
-        const char *e = getenv("RECOMP_TITLE_KEVENTS");
-        enabled = e && *e == '1';
-    }
-    if (!enabled)
+    if (!title_kevents_enabled())
         return NULL;
     if (guest_va < 0x10000u || (guest_va & 3u))
         return NULL;
@@ -7672,7 +7854,7 @@ static HANDLE ke_guest_event(uint32_t guest_va, int *type)
         static int shown;
         if (shown++ < 16)
             fprintf(stderr, "  [KERNEL] event 0x%08X built by the title: host event created "
-                            "(%s)\n", guest_va, *type ? "synchronization" : "notification");
+                            "(%s) handle=%p\n", guest_va, *type ? "synchronization" : "notification", h);
     }
     return h;
 }
@@ -8445,11 +8627,13 @@ static void bridge_KePulseEvent(void)
             return;
         }
     }
-    h = ke_shadow_lookup(guest_va);
-    if (!h)
-        h = XBOX_TO_NATIVE(guest_va);
-    if (h)
-        PulseEvent(h);
+    h = ke_resolve_sync_object(guest_va, 0);
+    if (!h) {
+        ke_log_unresolved("KePulseEvent", guest_va);
+        g_eax = 0;
+        return;
+    }
+    PulseEvent(h);
 
     g_eax = 0; /* previous state unknown */
 }
@@ -8467,10 +8651,10 @@ static void bridge_KeReleaseMutant(void)
     (void)wait;
     (void)abandoned;
 
-    h = ke_shadow_lookup(guest_va);
+    h = ke_resolve_sync_object(guest_va, 0);
     if (!h)
-        h = XBOX_TO_NATIVE(guest_va);
-    if (h)
+        ke_log_unresolved("KeReleaseMutant", guest_va);
+    else
         ReleaseMutex(h);
 
     g_eax = 0;
@@ -8488,10 +8672,10 @@ static void bridge_KeReleaseSemaphore(void)
     (void)increment;
     (void)wait;
 
-    h = ke_shadow_lookup(guest_va);
+    h = ke_resolve_sync_object(guest_va, 0);
     if (!h)
-        h = XBOX_TO_NATIVE(guest_va);
-    if (h)
+        ke_log_unresolved("KeReleaseSemaphore", guest_va);
+    else
         ReleaseSemaphore(h, (LONG)adjustment, NULL);
 
     g_eax = 0;
@@ -8513,10 +8697,10 @@ static void bridge_KeResetEvent(void)
             return;
         }
     }
-    h = ke_shadow_lookup(guest_va);
+    h = ke_resolve_sync_object(guest_va, 0);
     if (!h)
-        h = XBOX_TO_NATIVE(guest_va);
-    if (h)
+        ke_log_unresolved("KeResetEvent", guest_va);
+    else
         ResetEvent(h);
 
     g_eax = 0;
@@ -10823,6 +11007,35 @@ static void kernel_thunk_dispatch_body(void)
     ordinal = g_slot_ordinals[slot];
     bridge = g_slot_bridges[slot];
 
+    /* RECOMP_ORD_LOG=1: print the resolved C function of each ordinal once. */
+    {
+        static signed char ord_seen[1024];
+        static signed char ord_log = -1;
+        if (ord_log < 0) {
+            const char *e = getenv("RECOMP_ORD_LOG");
+            ord_log = (e && e[0] && e[0] != '0') ? 1 : 0;
+        }
+        if (ord_log && slot >= 0 && slot < 1024 && !ord_seen[slot]) {
+#ifndef _WIN32
+            Dl_info di;
+#endif
+            ord_seen[slot] = 1;
+#if defined(_WIN32)
+            /* No dladdr on Windows: report the bridge address as-is. */
+            fprintf(stderr, "  [ORD] slot %d ordinal %u -> %p\n",
+                    slot, ordinal, (void *)bridge);
+#else
+            if (bridge && dladdr((void *)bridge, &di))
+                fprintf(stderr, "  [ORD] slot %d ordinal %u -> off 0x%llx\n",
+                        slot, ordinal,
+                        (unsigned long long)((uintptr_t)bridge - (uintptr_t)di.dli_fbase));
+            else
+                fprintf(stderr, "  [ORD] slot %d ordinal %u -> %p\n",
+                        slot, ordinal, (void *)bridge);
+#endif
+        }
+    }
+
     g_kernel_call_count++;
     if (ordinal < XBOX_KERNEL_THUNK_TABLE_SIZE)
         g_ordinal_calls[ordinal]++;
@@ -11192,5 +11405,11 @@ void xbox_kernel_bridge_init(void)
             resolved, g_thunk_table_count, bridged, unbridged);
     fprintf(stderr, "  Synthetic VA range: 0x%08X-0x%08X\n",
             KERNEL_VA_BASE, KERNEL_VA_BASE + (resolved - 1) * 4);
+
+    /* USB OHCI. The trap model is opt-in (RECOMP_USB) because a controller
+     * that can be found but not enumerated changes what a title does. It has
+     * to be installed here, after the guest memory is mapped, or the title
+     * reads plain zeroed RAM and concludes there is no controller at all. */
+    xbox_OhciInit();
 
 }

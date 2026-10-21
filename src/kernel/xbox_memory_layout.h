@@ -222,6 +222,12 @@ uint32_t xbox_ContiguousInUseBytes(void);
 
 int xbox_Nv2aMirrorFence(uint32_t device_ptr_va,
                          uint32_t put_off, uint32_t get_ptr_off);
+/* Same mirror, plus a title-built KEVENT embedded in the device at
+ * event_off: whenever PUT advances, signal it too (the GPU interrupt that
+ * would normally do so is not delivered by the runtime). */
+int xbox_Nv2aMirrorFenceEvent(uint32_t device_ptr_va,
+                              uint32_t put_off, uint32_t get_ptr_off,
+                              uint32_t event_off);
 
 /* Where the mirrored fence word is (0 if none is registered or it does not
  * resolve into the contiguous window). For the pushbuffer executor. */

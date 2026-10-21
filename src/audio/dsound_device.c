@@ -43,6 +43,30 @@ static DSoundBuffer *buf_from_iface(IDirectSoundBuffer8 *iface)
     return (DSoundBuffer *)iface;
 }
 
+/* Point the mixer voice at this buffer's storage.
+ *
+ * This is the whole of the streaming path: Lock hands the caller a pointer
+ * into buffer_data and the mixer reads that same memory, so Unlock has no
+ * bytes to copy.  It has to happen for buffers created at their final size
+ * as well as for SetBufferData(): without it apu_mixer_play() sees no PCM
+ * and returns without starting the voice, which is silence with S_OK at
+ * every level. */
+static void buf_bind_voice(DSoundBuffer *buf)
+{
+    APUMixerVoice *v;
+
+    if (buf->mixer_slot < 0)
+        return;
+    v = apu_mixer_get_voice(buf->mixer_slot);
+    if (!v)
+        return;
+    v->pcm_data    = (const int16_t *)buf->buffer_data;
+    v->pcm_bytes   = buf->buffer_data ? buf->buffer_size : 0;
+    v->play_offset = 0;
+    v->num_channels = buf->channels;
+    v->sample_rate  = buf->frequency;
+}
+
 static HRESULT __stdcall buf_QueryInterface(IDirectSoundBuffer8 *self, const IID *riid, void **ppv)
 {
     (void)self; (void)riid; (void)ppv;
@@ -83,16 +107,7 @@ static HRESULT __stdcall buf_SetBufferData(IDirectSoundBuffer8 *self, const void
     }
 
     /* Update mixer voice with new buffer data */
-    if (buf->mixer_slot >= 0 && buf->bits_per_sample == 16) {
-        APUMixerVoice *v = apu_mixer_get_voice(buf->mixer_slot);
-        if (v) {
-            v->pcm_data = (const int16_t *)buf->buffer_data;
-            v->pcm_bytes = buf->buffer_data ? dwBufferBytes : 0;
-            v->play_offset = 0;
-            v->num_channels = buf->channels;
-            v->sample_rate = buf->frequency;
-        }
-    }
+    buf_bind_voice(buf);
     return S_OK;
 }
 
@@ -106,6 +121,7 @@ static HRESULT __stdcall buf_Lock(IDirectSoundBuffer8 *self, DWORD dwOffset, DWO
     void **ppvAudioPtr1, DWORD *pdwAudioBytes1, void **ppvAudioPtr2, DWORD *pdwAudioBytes2, DWORD dwFlags)
 {
     DSoundBuffer *buf = buf_from_iface(self);
+    DWORD first, room, second;
     (void)dwFlags;
 
     if (!buf->buffer_data || buf->buffer_size == 0) {
@@ -116,15 +132,30 @@ static HRESULT __stdcall buf_Lock(IDirectSoundBuffer8 *self, DWORD dwOffset, DWO
         return E_FAIL;
     }
 
-    /* Simple linear lock (no wraparound) */
+    /* DirectSound buffers are circular.  A lock that runs past the end is
+     * returned as two regions, second one starting at offset 0; a caller
+     * that only got the first region would silently lose the wrap and
+     * stream a permanently short period. */
     if (dwOffset >= buf->buffer_size) dwOffset = 0;
-    if (dwBytes == 0 || dwOffset + dwBytes > buf->buffer_size)
+    /* dwBytes == 0 means "from offset to the end" and therefore never wraps;
+     * an explicit size may wrap, but not by more than the whole buffer. */
+    if (dwBytes == 0)
         dwBytes = buf->buffer_size - dwOffset;
+    else if (dwBytes > buf->buffer_size)
+        dwBytes = buf->buffer_size;
+
+    first  = dwBytes;
+    room   = buf->buffer_size - dwOffset;
+    second = 0;
+    if (dwBytes > room) {
+        first  = room;
+        second = dwBytes - room;
+    }
 
     if (ppvAudioPtr1) *ppvAudioPtr1 = (BYTE *)buf->buffer_data + dwOffset;
-    if (pdwAudioBytes1) *pdwAudioBytes1 = dwBytes;
-    if (ppvAudioPtr2) *ppvAudioPtr2 = NULL;
-    if (pdwAudioBytes2) *pdwAudioBytes2 = 0;
+    if (pdwAudioBytes1) *pdwAudioBytes1 = first;
+    if (ppvAudioPtr2) *ppvAudioPtr2 = second ? (BYTE *)buf->buffer_data : NULL;
+    if (pdwAudioBytes2) *pdwAudioBytes2 = second;
     return S_OK;
 }
 
@@ -284,11 +315,14 @@ static HRESULT __stdcall ds_CreateSoundBuffer(IDirectSound8 *self, const DSBUFFE
         }
     }
 
-    /* Pre-allocate buffer if size specified */
+    /* Pre-allocate buffer if size specified, and point the voice at it now:
+     * a streaming buffer is filled through Lock/Unlock and never calls
+     * SetBufferData, so this is its only chance to become audible. */
     if (desc && desc->dwBufferBytes > 0) {
         buf->buffer_data = calloc(1, desc->dwBufferBytes);
         buf->buffer_size = desc->dwBufferBytes;
     }
+    buf_bind_voice(buf);
 
     static int create_log_count = 0;
     if (create_log_count < 30) {

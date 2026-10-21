@@ -170,13 +170,14 @@ static void dump_program(uint32_t start)
         dis_src(bb, sizeof bb, ins, 1);
         dis_src(c, sizeof c, ins, 2);
         fprintf(stderr, "  [VSH] %3u %-4s %-4s A=%s B=%s C=%s  R%u mac%X ilu%X"
-                " out%s%u m%X%s%s\n", s,
+                " out%s%u m%X%s%s  w=%08X %08X %08X %08X\n", s,
                 k_mac[field(ins, 1, 21, 4)], k_ilu[field(ins, 1, 25, 3)],
                 a, bb, c, field(ins, 3, 20, 4), field(ins, 3, 24, 4),
                 field(ins, 3, 16, 4), field(ins, 3, 11, 1) ? "o" : "c",
                 field(ins, 3, 3, 8), field(ins, 3, 12, 4),
                 field(ins, 3, 2, 1) ? " ilu" : " mac",
-                field(ins, 3, 0, 1) ? " FINAL" : "");
+                field(ins, 3, 0, 1) ? " FINAL" : "",
+                ins[0], ins[1], ins[2], ins[3]);
         if (field(ins, 3, 0, 1))
             break;
     }

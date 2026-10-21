@@ -666,6 +666,8 @@ translate:
 
 #include <unistd.h>
 #include <stdlib.h>
+#include <dirent.h>
+#include <strings.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <errno.h>
@@ -816,6 +818,88 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
              s_game_dir, s_save_dir, s_user_dir);
 }
 
+/* ── case-insensitive fallback ───────────────────────────────────────────────
+   The disc was authored for a case-insensitive filesystem, and the title
+   mixes case freely: it asks for `menu\fe_bg07a.dds` while the stored name is
+   `fe_bg07A.dds`, and for `sound\stream\menu_bgm.xps` while the directory is
+   `Sound`. On a case-sensitive host every such miss looked like a missing
+   asset. Each component that does not exist exactly is matched (ASCII
+   case-insensitively) against its parent directory; components with no match
+   are kept verbatim so that file creation still targets the requested name. */
+
+static void ci_component(const char* parent, char* comp, size_t cap)
+{
+    char probe[MAX_PATH];
+    struct dirent* ent;
+    DIR* dir;
+
+    if (*parent)
+        snprintf(probe, sizeof(probe), "%s/%s", parent, comp);
+    else
+        snprintf(probe, sizeof(probe), "/%s", comp);
+    if (access(probe, F_OK) == 0)
+        return;
+
+    dir = opendir(*parent ? parent : "/");
+    if (!dir)
+        return;
+    while ((ent = readdir(dir)) != NULL) {
+        if (strcasecmp(ent->d_name, comp) == 0) {
+            snprintf(comp, cap, "%s", ent->d_name);
+            break;
+        }
+    }
+    closedir(dir);
+}
+
+static void ci_fix_path(char* path)
+{
+    char out[MAX_PATH];
+    const char* p = path;
+    size_t used = 0;
+
+    if (access(path, F_OK) == 0)
+        return;
+
+    out[0] = '\0';
+    if (*p == '/') {
+        out[used++] = '/';
+        out[used] = '\0';
+        p++;
+    }
+
+    while (*p) {
+        const char* slash = strchr(p, '/');
+        size_t len = slash ? (size_t)(slash - p) : strlen(p);
+        char comp[256];
+
+        if (len == 0 || len >= sizeof(comp))
+            return;
+        memcpy(comp, p, len);
+        comp[len] = '\0';
+
+        /* "/" alone means "the root", which the helper spells as "". */
+        ci_component((used == 1 && out[0] == '/') ? "" : out, comp, sizeof(comp));
+
+        if (used > 0 && out[used - 1] != '/') {
+            if (used + 1 >= sizeof(out))
+                return;
+            out[used++] = '/';
+        }
+        if (used + strlen(comp) >= sizeof(out))
+            return;
+        memcpy(out + used, comp, strlen(comp) + 1);
+        used += strlen(comp);
+
+        p += len;
+        if (*p == '/')
+            p++;
+    }
+
+    if (used > 0)
+        memcpy(path, out, used + 1);
+}
+
 BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, DWORD buf_size)
 {
     const char* remainder = NULL;
@@ -890,6 +974,8 @@ translate:
             while (n > 1 && host_path_buf[n - 1] == '/')
                 host_path_buf[--n] = '\0';
         }
+
+        ci_fix_path(host_path_buf);
 
         XBOX_TRACE(XBOX_LOG_PATH, "%s -> %s", xbox_path, host_path_buf);
         /* As the Win32 backend does: the bridge reads back the host path

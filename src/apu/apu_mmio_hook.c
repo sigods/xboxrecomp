@@ -23,6 +23,7 @@ MCPXAPUState *g_apu_state = NULL;
 #if defined(_WIN32)
 #include <windows.h>
 #include "../platform/mmio_decode.h"
+#include "../platform/mmio_decode_x86_64.h"
 
 /* APU MMIO base in Xbox VA space */
 #define APU_MMIO_BASE  0xFE800000u
@@ -75,7 +76,7 @@ static bool apu_decode_and_handle(PCONTEXT ctx, uint32_t mmio_offset, int is_wri
 
     (void)is_write;
     if (!g_apu_state) return false;
-    if (mmio_emulate(ctx, mmio_offset, g_apu_state, apu_mmio_rd, apu_mmio_wr))
+    if (mmio_emulate_x86_64(ctx, mmio_offset, g_apu_state, apu_mmio_rd, apu_mmio_wr))
         return true;
 
     /* Unrecognized */
@@ -120,12 +121,18 @@ bool apu_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
 
 #endif /* _WIN32 */
 
-#if !defined(_WIN32) && defined(__aarch64__)
-/* POSIX arm64: the same hook over sigaction + ucontext, with the A64 decoder
- * (src/platform/mmio_decode_a64.h). The host's fault handler reaches it
- * through xbox_PosixMmioFault before it reports a crash. */
+#if !defined(_WIN32) && (defined(__aarch64__) \
+        || (defined(__x86_64__) && defined(__linux__)))
+/* POSIX: the same hook over sigaction + ucontext, with the arch's decoder
+ * (src/platform/mmio_decode_a64.h on arm64, mmio_decode_x86_64.h on x86-64).
+ * The host's fault handler reaches it through xbox_PosixMmioFault before it
+ * reports a crash. */
 #include <signal.h>
+#if defined(__aarch64__)
 #include "../platform/mmio_decode_a64.h"
+#else
+#include "../platform/mmio_decode_x86_64.h"
+#endif
 
 #define APU_MMIO_BASE  0xFE800000u
 #define APU_MMIO_SIZE  0x00080000u
@@ -167,7 +174,11 @@ bool apu_hook_handle_mmio_posix(void *ucv, uintptr_t fault_addr,
     (void)fault_addr; (void)is_write;
     if (!g_apu_state || off >= APU_MMIO_SIZE)
         return false;
+#if defined(__aarch64__)
     if (mmio_emulate_a64(uc, off, g_apu_state, apu_mmio_rd, apu_mmio_wr))
+#else
+    if (mmio_emulate_x86_64(uc, off, g_apu_state, apu_mmio_rd, apu_mmio_wr))
+#endif
         return true;
     g_apu_mmio_decode_fail++;
     /* stdio in a signal handler is not async-signal-safe. The process is
@@ -175,8 +186,8 @@ bool apu_hook_handle_mmio_posix(void *ucv, uintptr_t fault_addr,
      * capped at 20, as on Windows. */
     if (g_apu_mmio_decode_fail <= 20)
         fprintf(stderr, "[APU] MMIO decode fail at PC=%p insn=%08X offset=0x%X\n",
-                (void *)(uintptr_t)A64_CTX_PC(uc),
-                *(const uint32_t *)(uintptr_t)A64_CTX_PC(uc), off);
+                (void *)MMIO_CTX_PC(uc),
+                *(const uint32_t *)(uintptr_t)MMIO_CTX_PC(uc), off);
     return false;
 }
 #endif

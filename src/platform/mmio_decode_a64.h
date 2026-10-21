@@ -81,6 +81,11 @@ static inline __uint128_t *mmio_a64_linux_vregs(ucontext_t *uc)
 #define A64_CTX_V_OK(uc) 1
 #endif
 
+/* Arch-neutral names for the faulting PC. Callers that serve both hosts use
+ * these instead of A64_CTX_PC; mmio_decode_x86_64.h defines the same pair. */
+#define MMIO_CTX_PC(uc)        ((uintptr_t)A64_CTX_PC(uc))
+#define MMIO_CTX_SET_PC(uc, v) (A64_CTX_PC(uc) = (v))
+
 typedef uint64_t (*mmio_a64_read_fn)(void *dev, uint32_t off, int size);
 typedef void     (*mmio_a64_write_fn)(void *dev, uint32_t off, uint64_t val, int size);
 

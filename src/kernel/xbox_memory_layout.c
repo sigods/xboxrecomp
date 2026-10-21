@@ -656,8 +656,13 @@ static LONG CALLBACK ac97_write_veh(PEXCEPTION_POINTERS ep)
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
-#if !defined(_WIN32) && defined(__aarch64__)
+#if !defined(_WIN32) && (defined(__aarch64__) \
+        || (defined(__x86_64__) && defined(__linux__)))
+#if defined(__aarch64__)
 #include "../platform/mmio_decode_a64.h"
+#else
+#include "../platform/mmio_decode_x86_64.h"
+#endif
 #include <sys/mman.h>
 static size_t g_ac97_hsize;    /* host page: 16 KB on arm64 Darwin */
 
@@ -705,8 +710,15 @@ int xbox_Ac97PosixFault(void *ucv, uintptr_t fault)
         __atomic_store_n(&g_ac97_posix_lock, 0, __ATOMIC_RELEASE);
         return 0;
     }
-    ok = mmio_emulate_a64((ucontext_t *)ucv, (uint32_t)(fault - (uintptr_t)g_ac97_page),
+#if defined(__aarch64__)
+    ok = mmio_emulate_a64((ucontext_t *)ucv,
+                          (uint32_t)(fault - (uintptr_t)g_ac97_page),
                           g_ac97_page, ac97_posix_rd, ac97_posix_wr);
+#else
+    ok = mmio_emulate_x86_64((ucontext_t *)ucv,
+                             (uint32_t)(fault - (uintptr_t)g_ac97_page),
+                             g_ac97_page, ac97_posix_rd, ac97_posix_wr);
+#endif
     if (ok)
         ac97_clear_reset_bits();
     mprotect(g_ac97_page, g_ac97_hsize, PROT_READ);
@@ -724,7 +736,8 @@ static void ac97_arm_write_trap(void)
 
     if (!g_mcpx_memory || g_ac97_page)
         return;
-#if !defined(_WIN32) && !defined(__aarch64__)
+#if !defined(_WIN32) && !defined(__aarch64__) \
+        && !(defined(__x86_64__) && defined(__linux__))
     /* No POSIX decoder for this host's stores: a trapped write would be a
      * fault nothing services. Leave the page writable. */
     (void)old;
@@ -733,7 +746,8 @@ static void ac97_arm_write_trap(void)
     return;
 #endif
     g_ac97_page = (char *)g_mcpx_memory + AC97_NABM_OFFSET;
-#if !defined(_WIN32) && defined(__aarch64__)
+#if !defined(_WIN32) && (defined(__aarch64__) \
+        || (defined(__x86_64__) && defined(__linux__)))
     (void)old;
     g_ac97_hsize = (size_t)sysconf(_SC_PAGESIZE);
     if (g_ac97_hsize < AC97_TRAP_BYTES)
@@ -831,19 +845,19 @@ int xbox_VehMmioFault(void *exception_pointers)
     return 0;
 }
 #else
-#if defined(__aarch64__)
+#if defined(__aarch64__) || (defined(__x86_64__) && defined(__linux__))
 extern bool apu_hook_handle_mmio_posix(void *ucv, uintptr_t fault_addr,
                                        uint32_t fault_xbox_va, int is_write);
 #endif
 
 /* POSIX: call from the title's SIGBUS/SIGSEGV handler (SA_SIGINFO) with its
  * ucontext_t * and si_addr; on 1, return from the handler and the thread
- * resumes after the emulated instruction. APU, then AC'97, then OHCI. Only
- * arm64 hosts have a decoder; elsewhere nothing is trapped and this returns
- * 0. */
+ * resumes after the emulated instruction. APU, then AC'97, then OHCI. Linux
+ * arm64 and Linux x86-64 have decoders; elsewhere nothing is trapped and this
+ * returns 0. */
 int xbox_PosixMmioFault(void *ucv, uintptr_t fault)
 {
-#if defined(__aarch64__)
+#if defined(__aarch64__) || (defined(__x86_64__) && defined(__linux__))
     uint32_t va;
 
     if (!mmio_fault_va(fault, &va))
@@ -861,6 +875,62 @@ int xbox_PosixMmioFault(void *ucv, uintptr_t fault)
 #endif
     return 0;
 }
+
+#if defined(__x86_64__) && defined(__linux__)
+/*
+ * Install the dispatcher itself on x86-64 Linux. The POSIX contract above is
+ * that the *title* installs an SA_SIGINFO handler and calls
+ * xbox_PosixMmioFault; a title whose POSIX main() predates that (the otogi1
+ * host does) would otherwise die on the first trapped APU/AC'97/OHCI access
+ * with the decoder never consulted.
+ *
+ * The previous disposition is kept and chained to on a fault no device owns,
+ * so a real crash is reported exactly as it was before this was installed.
+ * The watch tracer installs later/earlier in the same chain and forwards here
+ * for pages it does not own, so the two coexist.
+ */
+#include <signal.h>
+static struct sigaction g_mmio_prev_segv, g_mmio_prev_bus;
+
+static void mmio_posix_handler(int sig, siginfo_t *si, void *ucv)
+{
+    struct sigaction *prev = sig == SIGBUS ? &g_mmio_prev_bus
+                                           : &g_mmio_prev_segv;
+
+    if (si && xbox_PosixMmioFault(ucv, (uintptr_t)si->si_addr))
+        return;                             /* emulated; PC already advanced */
+    if (prev->sa_flags & SA_SIGINFO) {
+        if (prev->sa_sigaction) {
+            prev->sa_sigaction(sig, si, ucv);
+            return;
+        }
+    } else if (prev->sa_handler != SIG_DFL && prev->sa_handler != SIG_IGN) {
+        prev->sa_handler(sig);
+        return;
+    }
+    signal(sig, SIG_DFL);   /* returning re-faults and dies by the signal */
+}
+
+static void mmio_posix_install(void)
+{
+    static int installed;
+    struct sigaction sa;
+
+    if (installed)
+        return;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = mmio_posix_handler;
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_NODEFER;
+    sigemptyset(&sa.sa_mask);
+    if (sigaction(SIGBUS, &sa, &g_mmio_prev_bus) != 0
+            || sigaction(SIGSEGV, &sa, &g_mmio_prev_segv) != 0) {
+        fprintf(stderr, "  MMIO: could not install the POSIX fault handler;"
+                        " trapped registers will crash\n");
+        return;
+    }
+    installed = 1;
+}
+#endif
 #endif
 
 /*
@@ -1014,22 +1084,34 @@ static struct {
     uint32_t device_ptr_va;
     uint32_t put_off;
     uint32_t get_ptr_off;
+    uint32_t event_off;      /* 0 = no KEVENT to signal with the fence */
 } g_fence_mirrors[XBOX_MAX_FENCE_MIRRORS];
 static int g_fence_mirror_count = 0;
 
-int xbox_Nv2aMirrorFence(uint32_t device_ptr_va,
-                         uint32_t put_off, uint32_t get_ptr_off)
+int xbox_Nv2aMirrorFenceEvent(uint32_t device_ptr_va,
+                              uint32_t put_off, uint32_t get_ptr_off,
+                              uint32_t event_off)
 {
     if (g_fence_mirror_count >= XBOX_MAX_FENCE_MIRRORS)
         return -1;
     g_fence_mirrors[g_fence_mirror_count].device_ptr_va = device_ptr_va;
     g_fence_mirrors[g_fence_mirror_count].put_off = put_off;
     g_fence_mirrors[g_fence_mirror_count].get_ptr_off = get_ptr_off;
+    g_fence_mirrors[g_fence_mirror_count].event_off = event_off;
     g_fence_mirror_count++;
     fprintf(stderr, "  NV2A fence mirror: device at 0x%08X,"
             " PUT +0x%X -> *(GET +0x%X)\n",
             device_ptr_va, put_off, get_ptr_off);
+    if (event_off)
+        fprintf(stderr, "  NV2A fence mirror: signals KEVENT at device+0x%X\n",
+                event_off);
     return 0;
+}
+
+int xbox_Nv2aMirrorFence(uint32_t device_ptr_va,
+                         uint32_t put_off, uint32_t get_ptr_off)
+{
+    return xbox_Nv2aMirrorFenceEvent(device_ptr_va, put_off, get_ptr_off, 0);
 }
 /* A guest address is usable only once the window is mapped and it lands
  * inside it; the chain is followed fresh every poll because the title may not
@@ -1303,8 +1385,28 @@ static void fence_mirrors_tick(void)
             uint32_t put =
                 *(volatile uint32_t *)((uintptr_t)(dev + g_fence_mirrors[i].put_off)
                                        + g_memory_offset);
-            if (*fence != put)
+            if (*fence != put) {
                 *fence = put;
+                /* The GPU would raise the completion interrupt here. Titles
+                 * that wait on a KEVENT built into the device need the
+                 * SignalState and host event moved at the same moment as the
+                 * fence word, or the wait never wakes. */
+                if (g_fence_mirrors[i].event_off
+                        && fence_readable(dev + g_fence_mirrors[i].event_off, 8))
+                    xbox_KeSetGuestEvent(dev + g_fence_mirrors[i].event_off);
+            } else if (g_fence_mirrors[i].event_off
+                    && fence_readable(dev + g_fence_mirrors[i].event_off, 8)) {
+                /* GET == PUT: the engine is idle. The title may clear the
+                 * event and only then enter the wait, after the fence word
+                 * already stopped moving, so a signal tied to the change
+                 * alone can be missed and the wait never wakes. Re-signal an
+                 * idle event that was consumed; in this synchronous runtime
+                 * the submitted work really is complete. */
+                uint32_t event_va = dev + g_fence_mirrors[i].event_off;
+                if (*(volatile uint32_t *)((uintptr_t)(event_va + 4)
+                                           + g_memory_offset) == 0)
+                    xbox_KeSetGuestEvent(event_va);
+            }
         }
     }
 }
@@ -2408,6 +2510,14 @@ static DWORD WINAPI xbox_watchdog_thread(LPVOID unused)
      * CPU loop polling a global is exactly the case neither of those covers.
      */
     xbox_PeekSample("peek");
+    /* A title whose loader retries one open forever makes the same call
+     * twenty thousand times a second, and the per-attempt log is
+     * deduplicated to keep the console readable -- so the loop is the one
+     * place where the log says least. The summary is normally only printed
+     * from atexit, which a watchdog kill never reaches; print it here, from
+     * the thread that is about to report the hang, so the suppressed
+     * attempts are counted against the path that caused them. */
+    xbox_missing_summary("watchdog");
     /* The pushbuffer pointers, unconditionally.
      *
      * "Extend the table as more handshakes turn up -- run the title and the
@@ -2624,7 +2734,27 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
             g_span_size = (size_t)1 << 32;
             g_span_whole_window = 1;
         }
-        g_span_base = VirtualAlloc(NULL, g_span_size, MEM_RESERVE, PAGE_NOACCESS);
+        /* A NULL-hint reservation lands near the top of the user address
+         * space on Linux (0x7FFF....). The guest apertures are mapped at
+         * span_base + guest_addr, so 0x80000000+ runs past TASK_SIZE and
+         * fails with ENOMEM: the kernel page, NV2A, MCPX and flash windows
+         * all end up unmapped. Reserve low enough that base + 4 GB is
+         * addressable, and only fall back to a NULL hint. */
+        {
+            static const uintptr_t span_hints[] = {
+                0x0000000100000000ULL, /*   4 GB */
+                0x0000000400000000ULL, /*  16 GB */
+                0x0000001000000000ULL, /*  64 GB */
+                0x0000004000000000ULL, /* 256 GB */
+            };
+            for (size_t i = 0;
+                 i < sizeof(span_hints) / sizeof(span_hints[0]) && !g_span_base;
+                 i++)
+                g_span_base = VirtualAlloc((void *)span_hints[i], g_span_size,
+                                           MEM_RESERVE, PAGE_NOACCESS);
+        }
+        if (!g_span_base)
+            g_span_base = VirtualAlloc(NULL, g_span_size, MEM_RESERVE, PAGE_NOACCESS);
         if (g_span_base) {
             VirtualFree(g_span_base, g_memory_size, MEM_RELEASE);
             g_memory_base = MapViewOfFileEx(g_mapping_handle,
@@ -3602,6 +3732,11 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         win_settle_placeholders();
 #endif
     xbox_WatchInit();
+#if defined(__x86_64__) && defined(__linux__)
+    /* Before guest code runs: the decoders are useless if nothing raises the
+     * handler. The watch tracer above is now below this one in the chain. */
+    mmio_posix_install();
+#endif
     fprintf(stderr, "xbox_MemoryLayoutInit: complete\n");
     return TRUE;
 }

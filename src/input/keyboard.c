@@ -19,6 +19,7 @@
 #include "keyboard.h"
 #include "input_map.h"
 #include <stdlib.h>
+#include <time.h>
 #include <string.h>
 
 /* Reading this needs no lock. Each entry is written only by the window's
@@ -177,6 +178,23 @@ void xbox_InputKeyboardState(XBOX_INPUT_STATE *out)
      * these as a pressure never sees a press if they are 1), stick keys
      * are full deflection and opposite keys cancel. */
     xbox_InputMap_KeysResolve(&b, down, &out->Gamepad);
+
+    /* Headless test hook: this build has no game window, so no SDL key
+     * events and no way to skip an attract loop. With RECOMP_AUTOPAD=1,
+     * tap START and A on a slow cycle. Remove once real input exists. */
+    if (getenv("RECOMP_AUTOPAD") != NULL) {
+        static struct timespec t0;
+        struct timespec now;
+        if (t0.tv_sec == 0 && t0.tv_nsec == 0)
+            clock_gettime(CLOCK_MONOTONIC, &t0);
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        long long ms = (long long)(now.tv_sec - t0.tv_sec) * 1000 +
+                       (now.tv_nsec - t0.tv_nsec) / 1000000;
+        if ((ms / 2000) % 2 == 0)
+            out->Gamepad.wButtons |= XBOX_GAMEPAD_START;
+        if ((ms / 3000) % 2 == 0)
+            out->Gamepad.bAnalogButtons[0] = 255; /* A */
+    }
 
     /* The title's input layer looks for button edges, so the packet number
      * has to move whenever the state does or a press is never noticed. */

@@ -849,6 +849,13 @@ NTSTATUS __stdcall xbox_NtCreateMutant(PHANDLE MutantHandle, PXBOX_OBJECT_ATTRIB
 NTSTATUS __stdcall xbox_NtReleaseMutant(HANDLE MutantHandle, PLONG PreviousCount);
 
 LONG     __stdcall xbox_KeSetEvent(PVOID Event, LONG Increment, BOOLEAN Wait);
+/* Signal a KEVENT the title built by writing its dispatcher header into guest
+ * memory (used by the NV2A fence mirror). Creates/records the host event on
+ * first use; safe to call from any thread. */
+void xbox_KeSetGuestEvent(uint32_t guest_va);
+/* Per-title opt-in for title-built KEVENTs (default off; the
+ * RECOMP_TITLE_KEVENTS env var is still honoured when this is not called). */
+void xbox_EnableTitleEvents(int enable);
 NTSTATUS __stdcall xbox_KeWaitForSingleObject(PVOID Object, ULONG WaitReason, KPROCESSOR_MODE WaitMode, BOOLEAN Alertable, PLARGE_INTEGER Timeout);
 NTSTATUS __stdcall xbox_KeWaitForMultipleObjects(ULONG Count, PVOID Objects[], ULONG WaitType, ULONG WaitReason, KPROCESSOR_MODE WaitMode, BOOLEAN Alertable, PLARGE_INTEGER Timeout, PVOID WaitBlockArray);
 

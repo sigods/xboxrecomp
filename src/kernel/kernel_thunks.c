@@ -332,8 +332,9 @@ ULONG_PTR xbox_resolve_ordinal(ULONG ordinal)
     case 164: return (ULONG_PTR)&xbox_LaunchDataPage;
 
     default:
-        xbox_log(XBOX_LOG_ERROR, XBOX_LOG_THUNK,
-            "Unresolved kernel ordinal %u", ordinal);
+        /* The caller reports unresolved imports with the library name and
+         * thunk slot. Logging here as well would double every message -- and
+         * this resolver has no way to know which slot was being filled. */
         return 0;
     }
 }
@@ -425,12 +426,25 @@ void xbox_kernel_init(void)
      * The slot->ordinal mapping normally comes from the in-memory thunk table
      * of the loaded XBE (0x80000000|ordinal per entry, same source the kernel
      * bridge reads). That makes the table match any title's import order.
-     * Without a mapped XBE, fall back to the static reference list below. */
+     * Without a mapped XBE, fall back to the static reference list below.
+     *
+     * Walk only slots that actually exist. The old loop ran to the full 378
+     * slot capacity and, once past the title's thunk_count, fell back to
+     * g_thunk_ordinals[] -- which is zero-padded beyond its 147 reference
+     * entries. Ordinal 0 is not an import, but xbox_resolve_ordinal(0) used to
+     * log "Unresolved kernel ordinal 0" for every one of those padding slots,
+     * burying the two genuinely unresolved imports (35 and 37). */
     xbox_kernel_get_thunk_address(&thunk_base, &thunk_count);
-    for (ULONG i = 0; i < XBOX_KERNEL_THUNK_TABLE_SIZE; i++) {
+
+    BOOL have_table = thunk_base && thunk_count && xbox_GetMemoryBase();
+    ULONG slots = have_table ? thunk_count : XBOX_KERNEL_THUNK_TABLE_SIZE;
+    ULONG logged_unresolved[16];
+    ULONG logged_count = 0;
+
+    for (ULONG i = 0; i < slots; i++) {
         ULONG ordinal;
 
-        if (thunk_base && i < thunk_count && xbox_GetMemoryBase()) {
+        if (have_table) {
             uint32_t entry = *(volatile uint32_t *)
                 ((uintptr_t)(thunk_base + i * 4) + g_xbox_mem_offset);
             if (entry == 0) {
@@ -439,6 +453,13 @@ void xbox_kernel_init(void)
             ordinal = entry & 0x7FFFFFFF;
         } else {
             ordinal = g_thunk_ordinals[i];
+            if (ordinal == 0) {
+                break;  /* end of the reference list */
+            }
+        }
+
+        if (ordinal == 0) {
+            continue;  /* unpopulated slot, not an import */
         }
 
         ULONG_PTR ptr = xbox_resolve_ordinal(ordinal);
@@ -450,12 +471,30 @@ void xbox_kernel_init(void)
             /* Point unresolved thunks to our error handler */
             xbox_kernel_thunk_table[i] = (ULONG_PTR)xbox_unresolved_thunk;
             unresolved++;
+
+            BOOL already_logged = FALSE;
+            for (ULONG k = 0; k < logged_count; k++) {
+                if (logged_unresolved[k] == ordinal) {
+                    already_logged = TRUE;
+                    break;
+                }
+            }
+            if (!already_logged) {
+                if (logged_count < 16) {
+                    logged_unresolved[logged_count++] = ordinal;
+                }
+                /* Kernel imports all come from xboxkrnl.exe, whose import run
+                 * is the header's KernelImageThunkAddress. */
+                xbox_log(XBOX_LOG_ERROR, XBOX_LOG_THUNK,
+                    "Unresolved kernel import: library XBOXKRNL ordinal %u "
+                    "(thunk slot %u)", ordinal, i);
+            }
         }
     }
 
     xbox_log(XBOX_LOG_INFO, XBOX_LOG_THUNK,
         "Thunk table: %u/%u resolved, %u unresolved",
-        resolved, XBOX_KERNEL_THUNK_TABLE_SIZE, unresolved);
+        resolved, slots, unresolved);
 
     if (unresolved > 0) {
         xbox_log(XBOX_LOG_WARN, XBOX_LOG_THUNK,

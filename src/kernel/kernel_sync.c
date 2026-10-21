@@ -14,7 +14,9 @@
  * Time values use NT 100-nanosecond units (negative = relative).
  */
 
+#include <stdio.h>
 #include "kernel.h"
+#include <stdlib.h>
 
 /* ============================================================================
  * Helper: Convert NT 100ns interval to Win32 milliseconds
@@ -259,7 +261,42 @@ NTSTATUS __stdcall xbox_KeWaitForSingleObject(
 
     HANDLE hObject = (HANDLE)Object;
     DWORD ms = xbox_nt_timeout_to_ms(Timeout);
-    DWORD result = WaitForSingleObjectEx(hObject, ms, Alertable);
+    DWORD result;
+
+    /* Long/forever wait probe: name the object the title is stuck on. */
+    if (ms == INFINITE || ms >= 5000) {
+        static PVOID seen[64];
+        static int seen_n = 0;
+        int i, dup = 0;
+        for (i = 0; i < seen_n; i++)
+            if (seen[i] == Object) { dup = 1; break; }
+        if (!dup && seen_n < 64) {
+            seen[seen_n++] = Object;
+            xbox_log(XBOX_LOG_INFO, XBOX_LOG_SYNC,
+                "long wait: object=%p ms=%u (alertable=%u)",
+                Object, (unsigned)ms, (unsigned)Alertable);
+        }
+    }
+
+    result = WaitForSingleObjectEx(hObject, ms, Alertable);
+
+    /* RECOMP_WAIT_LOG=1: name short-timeout polls (stall triage). */
+    {
+        static int wl = -1;
+        static unsigned long n;
+        if (wl < 0) {
+            const char *e = getenv("RECOMP_WAIT_LOG");
+            wl = (e && e[0] && e[0] != '0') ? 1 : 0;
+        }
+        if (wl && ms != INFINITE) {
+            if (n < 48 || (n % 500) == 0)
+                fprintf(stderr,
+                    "[otogi] wait poll: object=%p ms=%u -> 0x%08X\n", Object,
+                    (unsigned)ms, (unsigned)result);
+            n++;
+        }
+    }
+
     return xbox_wait_result_to_ntstatus(result, 1);
 }
 
@@ -509,16 +546,65 @@ static VOID CALLBACK xbox_dpc_work_callback(PTP_CALLBACK_INSTANCE Instance,
     }
 }
 
+/* RECOMP_DPC_LOG=1: log DPC submissions (identity + rate) for stall triage. */
+static int g_dpc_log = -1;
+static unsigned g_dpc_count;
+static void *g_dpc_last_routine;
+
+static void xbox_dpc_log_insert(PXBOX_KDPC d)
+{
+    if (g_dpc_log < 0) {
+        const char *e = getenv("RECOMP_DPC_LOG");
+        g_dpc_log = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    if (!g_dpc_log)
+        return;
+    if (g_dpc_count < 24 || (g_dpc_count % 512) == 0 ||
+        (void *)d->DeferredRoutine != g_dpc_last_routine) {
+        fprintf(stderr,
+            "[otogi] KeInsertQueueDpc #%u routine=0x%08X ctx=0x%08X arg1=0x%08X arg2=0x%08X\n",
+            g_dpc_count, (unsigned)(ULONG_PTR)d->DeferredRoutine,
+            (unsigned)(ULONG_PTR)d->DeferredContext,
+            (unsigned)(ULONG_PTR)d->SystemArgument1,
+            (unsigned)(ULONG_PTR)d->SystemArgument2);
+        g_dpc_last_routine = (void *)d->DeferredRoutine;
+    }
+    g_dpc_count++;
+}
+
 BOOLEAN __stdcall xbox_KeInsertQueueDpc(
     PXBOX_KDPC Dpc,
     PVOID SystemArgument1,
     PVOID SystemArgument2)
 {
-    if (!Dpc || !Dpc->DeferredRoutine)
+    if (!Dpc) {
+        if (g_dpc_log < 0) {
+            const char *e = getenv("RECOMP_DPC_LOG");
+            g_dpc_log = (e && e[0] && e[0] != '0') ? 1 : 0;
+        }
+        if (g_dpc_log && g_dpc_count < 8)
+            fprintf(stderr,
+                "[otogi] KeInsertQueueDpc #%u NULL Dpc\n", g_dpc_count);
+        g_dpc_count++;
         return FALSE;
+    }
+    if (!Dpc->DeferredRoutine) {
+        if (g_dpc_log < 0) {
+            const char *e = getenv("RECOMP_DPC_LOG");
+            g_dpc_log = (e && e[0] && e[0] != '0') ? 1 : 0;
+        }
+        if (g_dpc_log && g_dpc_count < 8)
+            fprintf(stderr,
+                "[otogi] KeInsertQueueDpc #%u DROPPED: dpc=%p routine=NULL\n",
+                g_dpc_count, (void *)Dpc);
+        g_dpc_count++;
+        return FALSE;
+    }
 
     Dpc->SystemArgument1 = SystemArgument1;
     Dpc->SystemArgument2 = SystemArgument2;
+
+    xbox_dpc_log_insert(Dpc);
 
     /* Submit to the Windows thread pool for async execution */
     if (!TrySubmitThreadpoolCallback(xbox_dpc_work_callback, Dpc, NULL)) {
