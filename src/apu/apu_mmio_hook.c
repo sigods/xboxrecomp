@@ -23,7 +23,6 @@ MCPXAPUState *g_apu_state = NULL;
 #if defined(_WIN32)
 #include <windows.h>
 #include "../platform/mmio_decode.h"
-#include "../platform/mmio_decode_x86_64.h"
 
 /* APU MMIO base in Xbox VA space */
 #define APU_MMIO_BASE  0xFE800000u
@@ -76,7 +75,7 @@ static bool apu_decode_and_handle(PCONTEXT ctx, uint32_t mmio_offset, int is_wri
 
     (void)is_write;
     if (!g_apu_state) return false;
-    if (mmio_emulate_x86_64(ctx, mmio_offset, g_apu_state, apu_mmio_rd, apu_mmio_wr))
+    if (mmio_emulate(ctx, mmio_offset, g_apu_state, apu_mmio_rd, apu_mmio_wr))
         return true;
 
     /* Unrecognized */
