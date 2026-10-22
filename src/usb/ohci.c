@@ -765,10 +765,22 @@ static int ohci_walk_eds(OhciController *hc, uint32_t ed, uint32_t *done_head)
             uint32_t td = head & ED_PTR_MASK;
             uint32_t next = rd32(td + 8) & ED_PTR_MASK;
             uint32_t cc = ohci_do_td(hc, ed0, td);
+            uint32_t flags = rd32(td);
+            uint32_t dp = (flags >> 19) & 3u;
+
+            /* The data toggle advances on every completed data stage, and the
+             * endpoint's carry follows it (QEMU hcd-ohci.c:1040-1053). Without
+             * this the toggle never moves and a pipe desynchronises after its
+             * first few transfers: enumeration still works, because every
+             * SETUP restarts the sequence at DATA0. */
+            if (cc == TD_CC_NOERROR && dp != TD_DP_SETUP) {
+                flags |= 0x02000000u;   /* T1: a toggle value was used */
+                flags ^= 0x01000000u;   /* T0: the next TD uses the other */
+            }
 
             /* Report the outcome where the driver reads it, then put the
              * descriptor on the done queue, newest first. */
-            wr32(td, (rd32(td) & 0x0FFFFFFFu) | (cc << 28));
+            wr32(td, (flags & 0x0FFFFFFFu) | (cc << 28));
             wr32(td + 8, *done_head);
             *done_head = td;
             completed++;
@@ -790,7 +802,8 @@ static int ohci_walk_eds(OhciController *hc, uint32_t ed, uint32_t *done_head)
                 }
             }
 
-            head = next | (head & ED_HEAD_TOGGLE);
+            head = next | ((flags & 0x01000000u) ? ED_HEAD_TOGGLE : 0);
+            wr32(ed + 8, head);     /* per TD, as the reference does */
             if (cc != TD_CC_NOERROR) {
                 head |= ED_HEAD_HALT;       /* a stall halts the endpoint */
                 break;
