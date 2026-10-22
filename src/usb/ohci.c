@@ -557,6 +557,22 @@ static uint32_t ohci_do_td(OhciController *hc, uint32_t ed0, uint32_t td)
     int      moved = 0;
     int      pad = ohci_pad_for(ed0);
 
+    /* RECOMP_USB_TDLOG: the descriptor as the driver armed it, before this
+     * function moves anything. Post-completion fields cannot say what the
+     * driver asked for, because CBP is rewritten at the end. */
+    {
+        static int tdlog = -1;
+        if (tdlog < 0)
+            tdlog = getenv("RECOMP_USB_TDLOG") != NULL;
+        if (tdlog) {
+            static unsigned n;
+            if (n++ < 400)
+                fprintf(stderr, "  [OHCI%d] TD %08X ED %08X dp=%u ep=%u "
+                        "cbp=%08X be=%08X len=%d pad=%d\n", hc->index, td,
+                        ed0, dp, endpoint, cbp, be, len, pad);
+        }
+    }
+
     if (pad < 0)
         return TD_CC_NOERROR;   /* no device at that address: ignore */
 
@@ -640,6 +656,18 @@ static uint32_t ohci_do_td(OhciController *hc, uint32_t ed0, uint32_t td)
             uint8_t rep[32];
             s_n_report++;
             int n = usb_gamepad_report(pad, rep, (int)sizeof rep);
+            {
+                static int tdlog = -1;
+                if (tdlog < 0)
+                    tdlog = getenv("RECOMP_USB_TDLOG") != NULL;
+                if (tdlog) {
+                    static unsigned m;
+                    if (m++ < 40)
+                        fprintf(stderr, "  [OHCI%d] report pad %d gave %d "
+                                "bytes, the descriptor allows %d\n",
+                                hc->index, pad, n, len);
+                }
+            }
             if (n > len) n = len;
             if (n > 0 && guest_ptr(cbp, (uint32_t)n))
                 memcpy(guest_ptr(cbp, (uint32_t)n), rep, (size_t)n);
@@ -744,6 +772,23 @@ static int ohci_walk_eds(OhciController *hc, uint32_t ed, uint32_t *done_head)
             wr32(td + 8, *done_head);
             *done_head = td;
             completed++;
+
+            /* RECOMP_USB_TDLOG: the descriptor exactly as the driver will
+             * find it on the done queue. A status stage that arrives with
+             * CBP=0, BE=0 and cc=0 is what a length-derived-from-BE+1-CBP
+             * computation turns into 1, or wraps. */
+            {
+                static int tdlog = -1;
+                if (tdlog < 0)
+                    tdlog = getenv("RECOMP_USB_TDLOG") != NULL;
+                if (tdlog) {
+                    static unsigned n;
+                    if (n++ < 400)
+                        fprintf(stderr, "  [OHCI%d] done %08X cc=%u cbp=%08X "
+                                "be=%08X info=%08X\n", hc->index, td, cc,
+                                rd32(td + 4), rd32(td + 12), rd32(td));
+                }
+            }
 
             head = next | (head & ED_HEAD_TOGGLE);
             if (cc != TD_CC_NOERROR) {

@@ -868,8 +868,16 @@ int xbox_PosixMmioFault(void *ucv, uintptr_t fault)
             && apu_hook_handle_mmio_posix(ucv, fault, va, 0);
     if (xbox_Ac97PosixFault(ucv, fault))
         return 1;
-    if (xbox_OhciOwnsAddress(va))
-        return xbox_OhciHandleMmio(ucv, va);
+    if (xbox_OhciOwnsAddress(va)) {
+        int r = xbox_OhciHandleMmio(ucv, va);
+        if (!r)
+            fprintf(stderr, "  [FAULT] OHCI owns 0x%08X but declined to "
+                            "decode it\n", va);
+        return r;
+    }
+    if (va >= 0xFED00000u && va < 0xFED01000u)
+        fprintf(stderr, "  [FAULT] 0x%08X is in the OHCI window but not "
+                        "claimed\n", va);
 #else
     (void)ucv; (void)fault;
 #endif
@@ -892,6 +900,49 @@ int xbox_PosixMmioFault(void *ucv, uintptr_t fault)
 #include <signal.h>
 static struct sigaction g_mmio_prev_segv, g_mmio_prev_bus;
 
+/* A fault no device claimed. Chaining to a previous handler that returns
+ * without fixing anything re-runs the same instruction forever, which looks
+ * exactly like a hang: same PC, no progress, no message. Name it instead. */
+static void mmio_posix_unclaimed(siginfo_t *si, void *ucv)
+{
+    static uintptr_t seen_va[8];
+    static unsigned long seen_hits[8];
+    uintptr_t va = 0;
+    uint32_t guest = 0;
+    unsigned i, hits = 0;
+    uintptr_t pc = 0;
+
+    if (si)
+        va = (uintptr_t)si->si_addr;
+    if (ucv)
+        pc = (uintptr_t)((ucontext_t *)ucv)->uc_mcontext.gregs[REG_RIP];
+    (void)mmio_fault_va(va, &guest);
+
+    for (i = 0; i < 8; i++) {
+        if (seen_va[i] == va && va) { hits = ++seen_hits[i]; break; }
+    }
+    if (!hits) {
+        for (i = 0; i < 8; i++) {
+            if (!seen_va[i]) {
+                seen_va[i] = va;
+                hits = seen_hits[i] = 1;
+                break;
+            }
+        }
+    }
+    if (hits && (hits <= 3 || hits == 100 || (hits % 10000) == 0)) {
+        fprintf(stderr, "  [FAULT] unclaimed %p (guest 0x%08X) pc=%p hits=%lu\n",
+                (void *)va, guest, (void *)pc, hits);
+        fflush(stderr);
+    }
+    if (hits == 1000 && getenv("RECOMP_FAULT_ABORT")) {
+        fprintf(stderr, "  [FAULT] 1000 unclaimed faults at %p; aborting\n",
+                (void *)va);
+        fflush(stderr);
+        abort();
+    }
+}
+
 static void mmio_posix_handler(int sig, siginfo_t *si, void *ucv)
 {
     struct sigaction *prev = sig == SIGBUS ? &g_mmio_prev_bus
@@ -899,6 +950,7 @@ static void mmio_posix_handler(int sig, siginfo_t *si, void *ucv)
 
     if (si && xbox_PosixMmioFault(ucv, (uintptr_t)si->si_addr))
         return;                             /* emulated; PC already advanced */
+    mmio_posix_unclaimed(si, ucv);
     if (prev->sa_flags & SA_SIGINFO) {
         if (prev->sa_sigaction) {
             prev->sa_sigaction(sig, si, ucv);

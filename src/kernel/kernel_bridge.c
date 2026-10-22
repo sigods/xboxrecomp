@@ -2054,6 +2054,8 @@ static void ke_log_unresolved(const char *fn, uint32_t guest_va)
 /* Signal a KEVENT the title built in guest memory. The fence mirror runs on
  * its own thread, so this goes through the shadow table's lock and uses the
  * same resolver every other bridge uses; SetEvent itself is thread-safe. */
+static int gate_trace_enabled(void);   /* defined beside the wait bridges */
+
 void xbox_KeSetGuestEvent(uint32_t guest_va)
 {
     int type = 0;
@@ -2070,6 +2072,8 @@ void xbox_KeSetGuestEvent(uint32_t guest_va)
     }
     BRIDGE_MEM32(guest_va + 4) = 1;   /* SignalState */
     SetEvent(h);
+    if (gate_trace_enabled())
+        fprintf(stderr, "[gate] signal object=0x%08X\n", guest_va);
 }
 
 /* Bring a header-owned host event in line with guest SignalState before a
@@ -2164,6 +2168,42 @@ static PLARGE_INTEGER bridge_wait_timeout(uint32_t timeout_ptr, const char *api,
     return scratch;
 }
 
+/* RECOMP_GATE_TRACE=1: name the guest object each wait blocks on, and each
+ * signal, so a stall can be mapped to the code that should have signalled it.
+ * The guest VA is only known here; xbox_KeWaitForSingleObject sees a host
+ * handle. Each object is reported once, then only its timeouts, sampled. */
+static int gate_trace_enabled(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_GATE_TRACE");
+        on = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    return on;
+}
+
+static void gate_trace_wait(uint32_t object, const char *kind, uint32_t status)
+{
+    static uint32_t seen[64];
+    static int seen_n;
+    static unsigned long n;
+    int i, dup = 0;
+
+    if (!gate_trace_enabled())
+        return;
+    for (i = 0; i < seen_n; i++)
+        if (seen[i] == object) { dup = 1; break; }
+    if (!dup && seen_n < 64) {
+        seen[seen_n++] = object;
+        fprintf(stderr, "[gate] wait object=0x%08X (%s) first -> 0x%08X\n",
+                object, kind, status);
+        return;
+    }
+    if (status != 0 && (n++ < 60 || (n % 500) == 0))
+        fprintf(stderr, "[gate] wait object=0x%08X (%s) -> 0x%08X\n",
+                object, kind, status);
+}
+
 static void bridge_KeWaitForSingleObject(void)
 {
     LARGE_INTEGER capped;
@@ -2183,6 +2223,7 @@ static void bridge_KeWaitForSingleObject(void)
             g_eax = (uint32_t)xbox_KeWaitForSingleObject(
                 ge, wait_reason, wait_mode, (BOOLEAN)alertable,
                 bridge_wait_timeout(timeout_ptr, "KeWaitForSingleObject", object, &capped));
+            gate_trace_wait(object, "title event", g_eax);
             if (g_eax == 0 && type == 1)               /* synchronization: consumed */
                 BRIDGE_MEM32(object + 4) = 0;
             return;
@@ -2202,6 +2243,7 @@ static void bridge_KeWaitForSingleObject(void)
     g_eax = (uint32_t)xbox_KeWaitForSingleObject(
         h, wait_reason, wait_mode, (BOOLEAN)alertable,
         bridge_wait_timeout(timeout_ptr, "KeWaitForSingleObject", object, &capped));
+    gate_trace_wait(object, "handle", g_eax);
 }
 
 /* ── NtWaitForSingleObject (ordinal 233) ─────────────────── */
