@@ -1,23 +1,25 @@
-# Vendored xboxrecomp
+# xboxrecomp submodule
 
-This directory is a source snapshot of the MIT-licensed
-[xboxrecomp](https://github.com/sp00nznet/xboxrecomp) runtime toolkit. It is
-checked in so that a clone of this repository builds without fetching,
-patching, or version-matching a separate checkout.
+This directory is the MIT-licensed
+[xboxrecomp](https://github.com/sp00nznet/xboxrecomp) runtime toolkit, pulled
+in as a git submodule from `sigods/xboxrecomp` on the `otogi1-linux-v0.1`
+branch. Clone with `--recursive`, or run `git submodule update --init` after
+an ordinary clone.
 
 | | |
 |---|---|
-| Upstream base | `v0.15.0` (`c98a641ae09815d3cce48065223f3df2d6f8584f`) |
-| Snapshot commit | `218547dfab81d38fac19761e16758fc0e35e3d03` ("otogi1-linux-v0.1") |
+| Upstream base | `v0.16.0` (`f0f8a46`) |
+| Branch head | `aa486c8` (`otogi1-linux-v0.1`, on the fork) |
 | License | MIT — see `LICENSE` in this directory |
 
-## Local changes against `v0.15.0`
+## Local changes against `v0.16.0`
 
-18 files, 1,687 insertions, 118 deletions. The ones that matter:
+18 files, 1,648 insertions, 118 deletions. The ones that matter:
 
 - `src/platform/mmio_decode_x86_64.h` — new. Decodes trapped x86-64 MMIO
   instructions on Linux (ucontext) and Windows (VEH `CONTEXT`). Without it the
-  APU/AC'97 and OHCI apertures fault on x86-64.
+  APU/AC'97 and OHCI apertures fault on x86-64. The Linux-only half is offered
+  upstream as sp00nznet/xboxrecomp#252.
 - `src/apu/apu_mmio_hook.c`, `src/usb/ohci.c` — call the decoder on both hosts;
   the OHCI entry point previously referenced a function that did not exist.
 - `src/kernel/kernel_bridge.c` — `bridge_async_io_enabled()` defaults to 1, so
@@ -32,13 +34,14 @@ patching, or version-matching a separate checkout.
 
 ## Updating
 
-There is no submodule and no patch file. To move to a newer upstream:
+The submodule tracks our fork, so a rebase is a branch operation in
+`sigods/xboxrecomp`:
 
-1. Check out the new upstream tag in a scratch clone.
-2. Diff it against `v0.15.0` and re-apply the local changes above.
-3. Replace this directory with the new tree, keeping this file's table current.
+1. Fetch the new upstream tag into the fork (add upstream as a remote once).
+2. `git rebase <tag>` on `otogi1-linux-v0.1`; the local changes above are plain
+   commits, so conflicts surface per hunk.
+3. Force-push the branch, then bump the gitlink in the parent repository
+   (`git add xboxrecomp`) and keep this file's table current.
 
-To hand a change back upstream, diff this directory against a pristine
-checkout of the base commit:
-
-    git diff --no-index /path/to/pristine-v0.15.0 ./third_party/xboxrecomp
+To hand a change back upstream, branch from the upstream tag rather than from
+this branch, so the diff carries only the topic change.
