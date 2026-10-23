@@ -890,6 +890,9 @@ KIRQL   __fastcall xbox_KfRaiseIrql(KIRQL NewIrql);
  * line for the whole processor on hardware, not just for one thread. */
 int     xbox_IrqlBlocksInterrupts(void);
 int     xbox_IrqlRaisedCount(void);
+/* Starts the RECOMP_IRQL_COUNT_TRACE 1 ms sample window (no-op unless set);
+ * called when the first USB interrupt is raised. */
+void    xbox_IrqlCountTraceUsbIrq(void);
 int     xbox_IrqlEnterInterrupt(int level);     /* around host-run ISRs and DPCs */
 /* The one-CPU DISPATCH gate (kernel_hal.c), on under RECOMP_DISPATCH_GATE=1.
  * Off (the default) the entries below succeed and take nothing. */

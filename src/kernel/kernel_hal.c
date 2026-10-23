@@ -62,8 +62,38 @@ extern ptrdiff_t g_xbox_mem_offset;
 static XBOX_THREAD_LOCAL int t_release_due;
 static void irql_release_due(void);
 
+/* RECOMP_IRQL_COUNT_TRACE: the per-call trace shows the pairs, but the
+ * number every device model reads is the process-wide count. The TLS level
+ * of each thread that has published one is kept here so the 1 ms sampler can
+ * show both sides of the question: did the count move, and which thread was
+ * sitting at which level when it did. Diagnostic only. */
+#define IRQL_LEVEL_SLOTS 8
+static struct { volatile LONG tid; volatile LONG level; } s_levels[IRQL_LEVEL_SLOTS];
+
+static void irql_level_note(void)
+{
+    unsigned long tid = (unsigned long)GetCurrentThreadId();
+    int i;
+
+    for (i = 0; i < IRQL_LEVEL_SLOTS; i++) {
+        LONG t = InterlockedCompareExchange(&s_levels[i].tid, 0, 0);
+        if (t == (LONG)tid) {
+            s_levels[i].level = (LONG)g_current_irql;
+            return;
+        }
+        if (t == 0) {
+            if (InterlockedCompareExchange(&s_levels[i].tid, (LONG)tid, 0) == 0) {
+                s_levels[i].level = (LONG)g_current_irql;
+                return;
+            }
+            i--;   /* another thread took the slot; retry this one */
+        }
+    }
+}
+
 static void irql_publish(void)
 {
+    irql_level_note();
     if (g_fs_base)
         *(volatile uint8_t *)((uintptr_t)g_xbox_mem_offset + g_fs_base
                               + 0x24) = (uint8_t)g_current_irql;
@@ -834,8 +864,104 @@ void xbox_IrqReport(void)
     fflush(stderr);
 }
 
+/* RECOMP_IRQL_TRACE (full trace): every raise and lower call, not only the
+ * DISPATCH crossings the first-twenty trace below reports. A depth that
+ * climbs by one and stays there is either a raise with no lower, a lower on
+ * another thread (the level is TLS, the count is global), or a lower that
+ * arrived while the caller was still in an ISR; the crossings alone cannot
+ * tell them apart because a call that never crosses DISPATCH moves nothing.
+ * Read at call time so the guest return address is the one on the stack for
+ * *this* call, and the tid names the thread that made it. Diagnostic only. */
+static void irql_trace_event(const char *what, KIRQL old, KIRQL new, void *ra)
+{
+    static int on = -1;
+    static volatile LONG n;
+    uint32_t guest_ra;
+
+    if (on < 0)
+        on = getenv("RECOMP_IRQL_TRACE") != NULL;
+    if (!on)
+        return;
+    if (InterlockedIncrement(&n) > 200000) {
+        if (n == 200001) {
+            fprintf(stderr, "  [IRQLTRACE] 200000 events reached; further "
+                    "raise/lower trace suppressed\n");
+            fflush(stderr);
+        }
+        return;
+    }
+    guest_ra = g_esp
+        ? *(uint32_t *)((uintptr_t)g_xbox_mem_offset + g_esp) : 0;
+    fprintf(stderr, "  [IRQLTRACE] tid %lu %-5s %d->%d cur=%d depth=%d "
+            "guest_ret=%08X host_ret=%p\n",
+            (unsigned long)GetCurrentThreadId(), what,
+            (int)old, (int)new, (int)g_current_irql,
+            xbox_IrqlRaisedCount(), guest_ra, ra);
+    fflush(stderr);
+}
+
+/* Every actual move of g_irql_raised_count, with the wrapper that made it.
+ * irql_track_gated() returns early when the DISPATCH membership does not
+ * change, so a 2->2 raise never reaches the Interlocked* below; that is the
+ * point of logging here rather than at the call sites. */
+static int s_count_trace = -1;
+
+static void irql_count_event(const char *site, LONG before, LONG after,
+                             KIRQL old_level, KIRQL new_level)
+{
+    if (s_count_trace < 0)
+        s_count_trace = getenv("RECOMP_IRQL_COUNT_TRACE") != NULL;
+    if (!s_count_trace)
+        return;
+    fprintf(stderr, "  [IRQLCOUNT] tid %lu %-7s count %ld->%ld tls %d->%d\n",
+            (unsigned long)GetCurrentThreadId(), site,
+            (long)before, (long)after, (int)old_level, (int)new_level);
+    fflush(stderr);
+}
+
+static volatile LONG s_count_sample_started;
+
+static DWORD WINAPI irql_count_sampler(LPVOID unused)
+{
+    uint64_t start = xbox_HostNowNs();
+    int i;
+
+    (void)unused;
+    for (i = 0; i < 3200; i++) {
+        uint64_t due, now;
+        int j;
+
+        fprintf(stderr, "  [IRQLSAMPLE] t=%lums depth=%d transitions=%d",
+                (unsigned long)((xbox_HostNowNs() - start) / 1000000ull),
+                xbox_IrqlRaisedCount(), xbox_IrqlTransitions());
+        for (j = 0; j < IRQL_LEVEL_SLOTS; j++) {
+            LONG t = InterlockedCompareExchange(&s_levels[j].tid, 0, 0);
+            if (t)
+                fprintf(stderr, " %ld:%ld", (long)t, (long)s_levels[j].level);
+        }
+        fprintf(stderr, "\n");
+        fflush(stderr);
+        due = start + (uint64_t)(i + 1) * 1000000ull;
+        now = xbox_HostNowNs();
+        if (now < due)
+            xbox_HostSleepNs(due - now);
+    }
+    return 0;
+}
+
+void xbox_IrqlCountTraceUsbIrq(void)
+{
+    if (s_count_trace < 0)
+        s_count_trace = getenv("RECOMP_IRQL_COUNT_TRACE") != NULL;
+    if (!s_count_trace)
+        return;
+    if (InterlockedCompareExchange(&s_count_sample_started, 1, 0) != 0)
+        return;
+    CreateThread(NULL, 0, irql_count_sampler, NULL, 0, NULL);
+}
+
 static void irql_track_gated(KIRQL old_level, KIRQL new_level, void *ra,
-                             int gate)
+                             int gate, const char *site)
 {
     int now = (new_level >= DISPATCH_LEVEL);
     /* With the gate off the count moves on the edge, as it did before the
@@ -858,6 +984,7 @@ static void irql_track_gated(KIRQL old_level, KIRQL new_level, void *ra,
     }
     d = now ? InterlockedIncrement(&g_irql_raised_count)
             : InterlockedDecrement(&g_irql_raised_count);
+    irql_count_event(site, now ? d - 1 : d + 1, d, old_level, new_level);
     InterlockedIncrement(&s_transitions);
     if (now)
         irql_holder_add(ra);
@@ -892,9 +1019,10 @@ static void irql_track_gated(KIRQL old_level, KIRQL new_level, void *ra,
     }
 }
 
-static void irql_track(KIRQL old_level, KIRQL new_level, void *ra)
+static void irql_track(KIRQL old_level, KIRQL new_level, void *ra,
+                       const char *site)
 {
-    irql_track_gated(old_level, new_level, ra, 1);
+    irql_track_gated(old_level, new_level, ra, 1, site);
 }
 
 /* Bracket a host-delivered ISR or DPC.
@@ -911,11 +1039,13 @@ static void irql_track(KIRQL old_level, KIRQL new_level, void *ra)
 int xbox_IrqlEnterInterrupt(int level)
 {
     int saved = (int)g_current_irql;
+
+    irql_trace_event("enter", g_current_irql, (KIRQL)level, IRQL_CALLER());
     if (g_current_irql != (KIRQL)level) {
         /* A DPC (DISPATCH_LEVEL) goes through the gate; a device ISR does
          * not (see s_dispatch_gate). */
         irql_track_gated(g_current_irql, (KIRQL)level, IRQL_CALLER(),
-                         level <= DISPATCH_LEVEL);
+                         level <= DISPATCH_LEVEL, "enter");
         g_current_irql = (KIRQL)level;
         irql_publish();
     }
@@ -924,8 +1054,9 @@ int xbox_IrqlEnterInterrupt(int level)
 
 void xbox_IrqlLeaveInterrupt(int saved)
 {
+    irql_trace_event("leave", g_current_irql, (KIRQL)saved, IRQL_CALLER());
     if (g_current_irql != (KIRQL)saved) {
-        irql_track(g_current_irql, (KIRQL)saved, IRQL_CALLER());
+        irql_track(g_current_irql, (KIRQL)saved, IRQL_CALLER(), "leave");
         g_current_irql = (KIRQL)saved;
         irql_publish();
     }
@@ -953,13 +1084,14 @@ KIRQL __fastcall xbox_KfRaiseIrql(KIRQL NewIrql)
 {
     KIRQL old = g_current_irql;
 
+    irql_trace_event("raise", old, NewIrql, IRQL_CALLER());
     if (NewIrql < old) {
         xbox_log(XBOX_LOG_WARN, XBOX_LOG_HAL,
             "KfRaiseIrql: attempt to lower IRQL from %d to %d (use KfLowerIrql)",
             old, NewIrql);
     }
 
-    irql_track(old, NewIrql, IRQL_CALLER());
+    irql_track(old, NewIrql, IRQL_CALLER(), "raise");
     g_current_irql = NewIrql;
     irql_publish();
     /* This thread now owns the processor at DISPATCH or above (any raise
@@ -979,6 +1111,7 @@ VOID __fastcall xbox_KfLowerIrql(KIRQL NewIrql)
 {
     KIRQL old;
 
+    irql_trace_event("lower", g_current_irql, NewIrql, IRQL_CALLER());
     if (NewIrql > g_current_irql) {
         /* A lower that would raise. The title's own pairs never do this;
          * one that does is restoring a level it read from somewhere other
@@ -1011,7 +1144,7 @@ VOID __fastcall xbox_KfLowerIrql(KIRQL NewIrql)
     }
 
     old = g_current_irql;
-    irql_track(old, NewIrql, IRQL_CALLER());
+    irql_track(old, NewIrql, IRQL_CALLER(), "lower");
     g_current_irql = NewIrql;
     irql_publish();
     /* Down from a device level to DISPATCH: the thread keeps the gate, and
@@ -1030,7 +1163,8 @@ KIRQL __stdcall xbox_KeRaiseIrqlToDpcLevel(void)
 {
     KIRQL old = g_current_irql;
 
-    irql_track(old, DISPATCH_LEVEL, IRQL_CALLER());
+    irql_trace_event("dpcraise", old, DISPATCH_LEVEL, IRQL_CALLER());
+    irql_track(old, DISPATCH_LEVEL, IRQL_CALLER(), "dpcraise");
     g_current_irql = DISPATCH_LEVEL;
     irql_publish();
     if (old < DISPATCH_LEVEL)

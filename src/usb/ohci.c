@@ -1029,6 +1029,7 @@ static void ohci_raise(OhciController *hc, uint32_t source)
     if (!(enable & INTR_MIE) || !(enable & source))
         return;
 
+    xbox_IrqlCountTraceUsbIrq();
     claimed = ohci_call_isr(hc);
     if (s_trace || claimed >= 0) {
         static unsigned n;
