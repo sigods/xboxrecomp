@@ -38,6 +38,11 @@ typedef struct {
     uint32_t pitch;             /* bytes per row */
     uint32_t bytes_per_pixel;   /* 2 or 4 */
     uint32_t aa_sx, aa_sy;      /* 1 or 2 each */
+    /* Where the clip rectangle sits inside that surface, in pixels: the
+     * rasteriser writes at (x + column, y + row), so a back end that puts
+     * pixels back into guest memory needs both. A back end that owns its own
+     * window can ignore them. */
+    uint32_t x, y;
 } Nv2aSurface;
 
 /* A texture as the title programmed it. uv in Nv2aVertex are in texels. */
@@ -80,6 +85,11 @@ typedef struct {
      * that ignores these draws that pass over the whole surface. */
     uint32_t stencil_enable, stencil_func, stencil_ref, stencil_func_mask;
     uint32_t stencil_write_mask, stencil_fail, stencil_zfail, stencil_zpass;
+    /* SURFACE_FORMAT as the title set it: the zeta format in bits 4-7 (1 is
+     * Z16, 2 is Z24S8) says how many bits the title's depth lives in, which
+     * is what a back end needs to compare window z in the title's own units
+     * rather than guessing a range of its own. */
+    uint32_t zeta_format;
 } Nv2aRenderState;
 
 typedef struct {

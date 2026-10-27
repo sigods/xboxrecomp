@@ -14,7 +14,30 @@ an ordinary clone.
 
 ## Local changes against `v0.16.0`
 
-18 files, 1,648 insertions, 118 deletions. The ones that matter:
+24 files, 3,154 insertions, 193 deletions. The ones that matter:
+
+- `src/nv2a/nv2a_pb_gl.c`, `nv2a_pb_gl.h` — new. An OpenGL 3.3 back end for the
+  push-buffer executor (`src/kernel/nv2a_backend.h`): it keeps one off-screen
+  colour+depth target per surface, applies the NV2A render state, draws the
+  batches the executor hands over, and reads the finished frame back into the
+  title's colour surface at flip. Offered upstream as the natural next step for
+  every title that currently runs on the CPU rasteriser.
+- `src/kernel/nv2a_vsh_interp.c` / `.h` — the vertex program is decoded once
+  per program (a generation counter bumps on every write) into a `VshIns`
+  table instead of four bitfield extractions per source per vertex, and
+  `nv2a_vsh_input_mask()` tells the executor which attribute streams the
+  program actually reads. Together with the vertex-transform pool in
+  `nv2a_pb_exec.c` (`RECOMP_XF_THREADS`) this took the start-game stage from
+  ~12 fps to ~40 fps, and a perf profile put the interpreter at 37% of every
+  host cycle before it.
+- `src/kernel/nv2a_pb_exec.c` — status reporting uses wall time
+  (`xbox_HostNowNs`) instead of `clock()`, which is summed over every thread;
+  a rasteriser that got faster by using more cores read as slower. Both pools
+  now exist on POSIX as well as Windows. `backend_flush()` flushes before the
+  present reads the surface, and the surface a back end sees now carries its
+  clip rectangle (`x`, `y`) and the zeta format.
+- `src/input/xinput_device.c` — `RECOMP_AUTOPRESS` on POSIX, with a START-then-A
+  schedule, so a headless run can reach a stage through the emulated USB pad.
 
 - `src/platform/mmio_decode_x86_64.h` — new. Decodes trapped x86-64 MMIO
   instructions on Linux (ucontext) and Windows (VEH `CONTEXT`). Without it the

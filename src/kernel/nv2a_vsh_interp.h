@@ -50,6 +50,12 @@ void nv2a_vsh_set_cxt_write(uint32_t enable);         /* _CXT_WRITE_EN      */
  * transform this batch" rather than drawing garbage. */
 int  nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out);
 
+/* Bit per v0..v15 the current program reads. The interpreter decodes the
+ * program once (not per vertex) and knows which attribute streams matter, so
+ * the executor fetches those and skips the rest -- a program using three
+ * inputs used to pay for sixteen fetches on every vertex. */
+uint32_t nv2a_vsh_input_mask(void);
+
 /* Direct access, for the self-test. */
 void nv2a_vsh_set_constant(uint32_t index, const float v[4]);
 const float *nv2a_vsh_constant(uint32_t index);   /* for traces */

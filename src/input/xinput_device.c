@@ -437,6 +437,64 @@ void xbox_InputInit(void)
     start_refresher();
 }
 
+/* Bring-up aid, the same idea as the Windows backend's RECOMP_AUTOPRESS: tap
+ * START and A on a period so a title parked on a "press start" logo, a menu
+ * or a save prompt is driven past it with no pad plugged in. The Windows one
+ * holds both down for the life of the run, which is enough to get past a
+ * single screen; a menu needs a release between presses, so this taps.
+ *
+ * It exists because the guest reaches a pad only through the emulated USB
+ * host, and a headless run has no other way in: the title's own menus are the
+ * only way to a stage, and a stage is the only way to see 3D.
+ * The schedule is START, then A: START twice over the first four seconds to
+ * get off the title screen, then a tap of A every RECOMP_AUTOPRESS_PERIOD_MS
+ * (default 1200 ms) for the rest of the run. A is what confirms in this
+ * title's menus and what a stage uses to attack; START left on the schedule
+ * would reopen the pause menu in the middle of it, which is how a long run
+ * ended up back in a menu instead of in the game.
+ *
+ * A press lasts a quarter of the period, so the driver sees an edge and not a
+ * button held down forever. */
+static int autopress_state(XBOX_INPUT_STATE *pState)
+{
+    static unsigned long long t0;
+    static unsigned long long period_ms;
+    unsigned long long now, phase;
+
+    if (!getenv("RECOMP_AUTOPRESS"))
+        return 0;
+    if (!t0) {
+        const char *e = getenv("RECOMP_AUTOPRESS_PERIOD_MS");
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        t0 = (unsigned long long)ts.tv_sec * 1000u
+           + (unsigned long long)ts.tv_nsec / 1000000u;
+        period_ms = e && *e ? strtoul(e, NULL, 0) : 1200u;
+        if (period_ms < 40u)
+            period_ms = 40u;
+    }
+    {
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        now = (unsigned long long)ts.tv_sec * 1000u
+            + (unsigned long long)ts.tv_nsec / 1000000u;
+    }
+    now -= t0;
+
+    /* The title screen: a START tap at 1.5 s and another at 3.5 s. */
+    if ((now >= 1500u && now < 1650u) || (now >= 3500u && now < 3650u)) {
+        pState->Gamepad.wButtons = XBOX_GAMEPAD_START;
+        pState->dwPacketNumber = (DWORD)(now / 100u) + 1;
+        return 1;
+    }
+    phase = now % period_ms;
+    if (phase >= period_ms / 4)
+        return 0;                       /* released between taps */
+    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_A] = 255;
+    pState->dwPacketNumber = (DWORD)(now / period_ms) + 1;
+    return 1;
+}
+
 DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
 {
     if (dwPort >= XBOX_MAX_CONTROLLERS || !pState)
@@ -445,6 +503,11 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
     input_ensure_ready();
     update_pads();
     rescan_controllers();
+
+    if (dwPort == 0 && autopress_state(pState)) {
+        g_controller_connected[0] = TRUE;
+        return ERROR_SUCCESS;
+    }
 
     SDL_GameController *c = pad_get((int)dwPort);
     if (!c || !SDL_GameControllerGetAttached(c)) {

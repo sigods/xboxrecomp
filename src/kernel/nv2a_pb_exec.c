@@ -44,6 +44,9 @@
 #include <windows.h>
 #define NV_TLS __declspec(thread)
 #else
+#include <pthread.h>
+#include <sys/resource.h>
+#include <unistd.h>
 #define NV_TLS __thread
 #endif
 
@@ -315,6 +318,7 @@ static struct {
     uint32_t clears, unhandled_total;
     uint32_t flip_read, flip_write, flip_modulo, flips;
     uint32_t tris_drawn, tris_skipped_offscreen, batches_untransformed;
+    uint32_t xf_bad_verts, xf_bad_batches_some, xf_bad_batches_all;
     /* Why a batch came out flat. "Untextured" has two causes that look
      * identical on screen and want opposite fixes: the batch carried no
      * texture coordinates, or it did and the stage was not usable. */
@@ -839,6 +843,8 @@ static void current_surface(Nv2aSurface *out)
     out->bytes_per_pixel = surface_bpp();
     out->aa_sx           = s_gpu.aa_sx > 1.5f ? 2 : 1;
     out->aa_sy           = s_gpu.aa_sy > 1.5f ? 2 : 1;
+    out->x               = s_gpu.clip_x;
+    out->y               = s_gpu.clip_y;
 }
 
 /* Render state in the NV2A's own values, gathered from what the executor
@@ -872,6 +878,7 @@ static void current_render_state(Nv2aRenderState *r)
     r->stencil_fail      = s_reg[0x0370 / 4];        /* SET_STENCIL_OP_FAIL */
     r->stencil_zfail     = s_reg[0x0374 / 4];        /* SET_STENCIL_OP_ZFAIL */
     r->stencil_zpass     = s_reg[0x0378 / 4];        /* SET_STENCIL_OP_ZPASS */
+    r->zeta_format       = s_gpu.format;
 }
 
 static int sample_texture(uint32_t u, uint32_t v, uint32_t *argb);
@@ -943,6 +950,8 @@ static void clear_surface(uint32_t param)
 
         if (!s_gpu.color_offset || !s_gpu.pitch || !s_gpu.clip_h || bpp == 0)
             return;
+        memset(&surf, 0, sizeof surf);
+        memset(&rs, 0, sizeof rs);
         current_surface(&surf);
         current_render_state(&rs);
         s_backend->clear(&surf, &rs, param, s_gpu.clear_color,
@@ -1148,6 +1157,12 @@ static uint32_t wrap_coord(uint32_t c, uint32_t size, uint32_t mode)
     int32_t sc = (int32_t)c, n = (int32_t)size;
     if (!size)
         return 0;
+    /* Inside the image every mode is the identity, and the texel a pixel
+     * samples is inside the image almost always. Without this the common
+     * case paid two integer divisions per axis (wrap) or three (mirror), in
+     * a function the profile put at 7% of a software-rendered frame. */
+    if (c < size)
+        return c;
     if (mode == 1)                         /* wrap */
         return (uint32_t)(((sc % n) + n) % n);
     if (mode == 2) {                       /* mirror */
@@ -2079,6 +2094,10 @@ static void backend_flush(int textured)
 
     if (!s_bcount)
         return;
+    memset(&surf, 0, sizeof surf);
+    memset(&rs, 0, sizeof rs);
+    memset(&tex, 0, sizeof tex);
+    memset(&batch, 0, sizeof batch);
     current_surface(&surf);
     current_render_state(&rs);
     batch.vertices = s_bverts;
@@ -2436,12 +2455,51 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
     const Nv2aVshOutput *va = T->va, *vb = T->vb, *vc = T->vc;
     int x, y, k;
 
+    /* Edge functions are linear in x at a fixed row, so the row can start
+     * from the exact span the three of them allow instead of testing every
+     * pixel of the bounding box. The span is deliberately a pixel wide at
+     * each end (floor rather than ceil): the inside test below still decides,
+     * and a rounding error at the threshold can only add a pixel that is then
+     * rejected, never drop one and leave a seam. */
+    {
+        float b0 = -(b[1] - a[1]), b1 = -(c[1] - b[1]), b2 = -(a[1] - c[1]);
+
     for (y = y0; y < T->maxy; y += step) {
-        for (x = T->minx; x < T->maxx; x++) {
-            float px = (float)x + 0.5f, py = (float)y + 0.5f;
-            float w0 = (b[0] - a[0]) * (py - a[1]) - (b[1] - a[1]) * (px - a[0]);
-            float w1 = (c[0] - b[0]) * (py - b[1]) - (c[1] - b[1]) * (px - b[0]);
-            float w2 = (a[0] - c[0]) * (py - c[1]) - (a[1] - c[1]) * (px - c[0]);
+        float py = (float)y + 0.5f;
+        float x0 = (float)T->minx + 0.5f;
+        float w0 = (b[0] - a[0]) * (py - a[1]) - (b[1] - a[1]) * (x0 - a[0]);
+        float w1 = (c[0] - b[0]) * (py - b[1]) - (c[1] - b[1]) * (x0 - b[0]);
+        float w2 = (a[0] - c[0]) * (py - c[1]) - (a[1] - c[1]) * (x0 - c[0]);
+        float lo = (float)T->minx, hi = (float)T->maxx;
+        int span_ok = 1;
+
+        /* Where each edge crosses zero along the row. B is its slope in x. */
+#define XF_EDGE_SPAN(wv, bv)                                                  \
+        do {                                                                  \
+            if ((bv) > 0.0f) {                                                \
+                float t = (float)T->minx - (wv) / (bv);                       \
+                if (t > lo) lo = t;                                           \
+            } else if ((bv) < 0.0f) {                                         \
+                float t = (float)T->minx - (wv) / (bv);                       \
+                if (t < hi) hi = t;                                           \
+            } else if ((wv) < 0.0f) {                                         \
+                span_ok = 0;                                                  \
+            }                                                                 \
+        } while (0)
+        XF_EDGE_SPAN(w0, b0);
+        XF_EDGE_SPAN(w1, b1);
+        XF_EDGE_SPAN(w2, b2);
+#undef XF_EDGE_SPAN
+        if (!span_ok)
+            continue;
+        {
+            int xs = (int)floorf(lo), xe = (int)floorf(hi) + 1;
+            if (xs < T->minx) xs = T->minx;
+            if (xe > T->maxx) xe = T->maxx;
+            w0 += b0 * (float)(xs - T->minx);
+            w1 += b1 * (float)(xs - T->minx);
+            w2 += b2 * (float)(xs - T->minx);
+            for (x = xs; x < xe; x++, w0 += b0, w1 += b1, w2 += b2) {
             float l0, l1, l2, z, col[4], pw;
             uint32_t argb;
             if (!((w0 >= 0 && w1 >= 0 && w2 >= 0)
@@ -2515,7 +2573,9 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
                 cnt->pixels++;
             }
             put_pixel(T->mem, T->bpp, x, y, argb);
+            }
         }
+    }
     }
 }
 
@@ -2534,16 +2594,6 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
 #define NV_RASTER_MAX_THREADS 16
 #define NV_RASTER_MT_MIN_PIXELS 8192
 
-#if defined(_WIN32)
-static struct {
-    int n;                                  /* threads incl. the caller */
-    HANDLE start[NV_RASTER_MAX_THREADS], done;
-    volatile LONG pending;
-    const XfTri *tris;
-    int ntris;
-    XfCount cnt[NV_RASTER_MAX_THREADS];
-} s_pool;
-
 /* Worker k owns the rows y with y % n == k, for every triangle of the run,
  * in submission order. Each pixel therefore sees its triangles in the order
  * the title drew them, whichever thread draws it. */
@@ -2556,6 +2606,16 @@ static void xf_rows_owned(const XfTri *tris, int ntris, int k, int n,
         xf_rows(&tris[i], y0, n, cnt);
     }
 }
+
+#if defined(_WIN32)
+static struct {
+    int n;                                  /* threads incl. the caller */
+    HANDLE start[NV_RASTER_MAX_THREADS], done;
+    volatile LONG pending;
+    const XfTri *tris;
+    int ntris;
+    XfCount cnt[NV_RASTER_MAX_THREADS];
+} s_pool;
 
 static DWORD WINAPI raster_worker(LPVOID arg)
 {
@@ -2625,13 +2685,121 @@ static void xf_rows_parallel(const XfTri *T, int ntris, long px,
     }
 }
 #else
+/* The same pool on the POSIX hosts, which had none: every triangle, however
+ * large, rasterised on the executor thread while the other cores idled. That
+ * was not a corner case -- a title spends most of a frame in a handful of
+ * full-screen passes, and *Otogi: Myth of Demons* ran its title screen at
+ * 0.8 fps for this reason alone. The guest even has a core to spare for its
+ * pushbuffer-full spin (48% of the cycles in a profile), so leaving two cores
+ * for the title and the host is enough here.
+ *
+ * A generation counter instead of a start event per worker: one broadcast
+ * wakes the whole pool per batch run, and the caller waits on one condition.
+ * Every worker reads s_ppool.tris after releasing the lock, which is safe
+ * because the next run cannot be published until the caller has seen all of
+ * them finish. */
+static pthread_mutex_t s_pool_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  s_pool_go = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t  s_pool_done = PTHREAD_COND_INITIALIZER;
+static struct {
+    int n;                                  /* threads incl. the caller */
+    int generation;
+    int finished;                           /* workers that ran this one */
+    const XfTri *tris;
+    int ntris;
+    pthread_t th[NV_RASTER_MAX_THREADS];
+    XfCount cnt[NV_RASTER_MAX_THREADS];
+} s_ppool;
+
+static void *raster_worker(void *arg)
+{
+    int k = (int)(intptr_t)arg;
+    int seen = 0;
+    /* Background priority. These threads are pure fill work with no deadline
+     * of their own, and a title's threads are not: the guest spends whole
+     * seconds spinning on a GPU fence, and a USB timer that fires late throws
+     * its own software queue into a self-link (see docs/KNOWN_ISSUES.md).
+     * A worker runs at the lowest nice value, so the guest and every kernel
+     * thread pre-empt it and the rasteriser takes what is left rather than
+     * what it can grab. Per-thread on Linux; the attribute does not exist on
+     * the Windows pool, which sets thread priority its own way. */
+    (void)setpriority(PRIO_PROCESS, 0, 19);
+    for (;;) {
+        pthread_mutex_lock(&s_pool_lock);
+        while (s_ppool.generation == seen)
+            pthread_cond_wait(&s_pool_go, &s_pool_lock);
+        seen = s_ppool.generation;
+        pthread_mutex_unlock(&s_pool_lock);
+        memset(&s_ppool.cnt[k], 0, sizeof s_ppool.cnt[k]);
+        xf_rows_owned(s_ppool.tris, s_ppool.ntris, k, s_ppool.n,
+                      &s_ppool.cnt[k]);
+        pthread_mutex_lock(&s_pool_lock);
+        if (++s_ppool.finished == s_ppool.n - 1)
+            pthread_cond_signal(&s_pool_done);
+        pthread_mutex_unlock(&s_pool_lock);
+    }
+    return NULL;
+}
+
+static int raster_pool_size(void)
+{
+    static int init;
+    if (!init) {
+        const char *e = getenv("RECOMP_RASTER_THREADS");
+        long cores = sysconf(_SC_NPROCESSORS_ONLN);
+        int n, k;
+        init = 1;
+        n = e ? atoi(e) : (int)cores - 2;
+        if (n < 1) n = 1;
+        if (n > NV_RASTER_MAX_THREADS) n = NV_RASTER_MAX_THREADS;
+        s_ppool.n = n;
+        for (k = 0; n > 1 && k < n - 1; k++) {
+            if (pthread_create(&s_ppool.th[k], NULL, raster_worker,
+                               (void *)(intptr_t)k) != 0) {
+                /* Fewer started than asked for: shrink the pool so the
+                 * caller covers the shares no worker owns. */
+                s_ppool.n = k + 1;
+                break;
+            }
+            pthread_detach(s_ppool.th[k]);
+        }
+    }
+    return s_ppool.n;
+}
+
 static void xf_rows_parallel(const XfTri *T, int ntris, long px,
                              XfCount *total)
 {
-    int k;
-    (void)px;
-    for (k = 0; k < ntris; k++)
-        xf_rows(&T[k], T[k].miny, 1, total);
+    int n = raster_pool_size(), k;
+
+    if (n <= 1 || px < NV_RASTER_MT_MIN_PIXELS) {
+        for (k = 0; k < ntris; k++)
+            xf_rows(&T[k], T[k].miny, 1, total);
+        return;
+    }
+    pthread_mutex_lock(&s_pool_lock);
+    s_ppool.tris = T;
+    s_ppool.ntris = ntris;
+    s_ppool.finished = 0;
+    s_ppool.generation++;
+    pthread_cond_broadcast(&s_pool_go);
+    pthread_mutex_unlock(&s_pool_lock);
+    {
+        XfCount mine = {0, 0, 0};
+        xf_rows_owned(T, ntris, n - 1, n, &mine);
+        total->depth_fail += mine.depth_fail;
+        total->pixels += mine.pixels;
+        total->zpass += mine.zpass;
+    }
+    pthread_mutex_lock(&s_pool_lock);
+    while (s_ppool.finished < n - 1)
+        pthread_cond_wait(&s_pool_done, &s_pool_lock);
+    pthread_mutex_unlock(&s_pool_lock);
+    for (k = 0; k < n - 1; k++) {
+        total->depth_fail += s_ppool.cnt[k].depth_fail;
+        total->pixels += s_ppool.cnt[k].pixels;
+        total->zpass += s_ppool.cnt[k].zpass;
+    }
 }
 #endif
 
@@ -2929,11 +3097,17 @@ static int batch_uses_program(void)
 static int transform_vertex(uint32_t index, Nv2aVshOutput *out)
 {
     float in[NV2A_VSH_INPUTS][4];
-    uint32_t a;
+    uint32_t a, need;
 
     if (!batch_uses_program())
         return ffp_vertex(index, out);
+    /* Only the attributes the program actually reads (nv2a_vsh_input_mask):
+     * a fetch is a bounds check, a format decode and a stride multiply, and
+     * most programs use a handful of the sixteen. */
+    need = nv2a_vsh_input_mask();
     for (a = 0; a < NV2A_VSH_INPUTS; a++) {
+        if (!(need & (1u << a)))
+            continue;
         /* An attribute with no array (size 0) reads its current value, the
          * one the SET_VERTEX_DATA* methods left -- as the hardware does --
          * not a fixed 0,0,0,1. SSX 3's sprite program passes its 4x4
@@ -2971,15 +3145,238 @@ static void xf_set_viewport(void)
     s_xf_o[2] = of[2];
 }
 
+/* RECOMP_XF_BAD=<n>: report the first n program batches that transform a
+ * vertex to a position no screen could hold -- non-finite, or millions of
+ * pixels out. A title whose world geometry is missing while its characters
+ * draw looks identical to a rasteriser bug in the census ("12.8M degenerate");
+ * what tells them apart is that the batched stream feeding the transform is
+ * already wrong, and this prints it: every attribute the vertex program reads,
+ * the values fetched for the offending vertex, and what the program made of
+ * them. Background counters only say how many. */
+static void xf_bad_report(uint32_t n)
+{
+    static int left = -1;
+    uint32_t i, bad = n, nbad = 0;
+
+    /* Only x and y: z is already depth-buffer units, and the viewport's z
+     * scale puts it in the millions (16.7M for 24-bit depth) for perfectly
+     * good vertices. w is checked because 1/w feeds every interpolation. */
+    for (i = 0; i < n; i++) {
+        const float *p = s_xf[i].pos;
+        if (!isfinite(p[0]) || !isfinite(p[1]) || !isfinite(p[3])
+            || fabsf(p[0]) > 1e6f || fabsf(p[1]) > 1e6f) {
+            if (bad == n)
+                bad = i;
+            nbad++;
+        }
+    }
+    if (nbad) {
+        s_gpu.xf_bad_verts += nbad;
+        if (nbad == n)
+            s_gpu.xf_bad_batches_all++;
+        else
+            s_gpu.xf_bad_batches_some++;
+    }
+    if (left < 0) {
+        const char *e = getenv("RECOMP_XF_BAD");
+        left = e ? atoi(e) : 0;
+    }
+    if (left <= 0 || !nbad)
+        return;
+    left--;
+    fprintf(stderr, "[XFBAD] batch %u prim %u n %u mode 0x%X idx %u %u %u"
+                    " bad vertex %u/%u\n", s_gpu.batches_program, s_gpu.prim,
+            n, s_gpu.xf_mode, s_gpu.idx[0], s_gpu.idx[1], s_gpu.idx[2],
+            bad, n);
+    for (i = 0; i < NV_VERTEX_ATTRS; i++) {
+        const VertexAttr *at = &s_gpu.attr[i];
+        float in[4];
+        if (!at->size) {
+            fprintf(stderr, "[XFBAD]   v%u immediate %g %g %g %g\n",
+                    i, s_gpu.imm_attr[i][0], s_gpu.imm_attr[i][1],
+                    s_gpu.imm_attr[i][2], s_gpu.imm_attr[i][3]);
+            continue;
+        }
+        fetch_attr(at, s_gpu.idx[bad], in);
+        fprintf(stderr, "[XFBAD]   v%u off %08X type %u size %u stride %u"
+                        " = %g %g %g %g\n", i, at->offset, at->type,
+                at->size, at->stride, in[0], in[1], in[2], in[3]);
+    }
+    for (i = 58; i < 60; i++) {
+        const float *c = nv2a_vsh_constant(i);
+        fprintf(stderr, "[XFBAD]   c[%u] %g %g %g %g\n", i,
+                c[0], c[1], c[2], c[3]);
+    }
+    for (i = bad > 0 ? bad - 1 : 0; i < n && i <= bad + 1; i++)
+        fprintf(stderr, "[XFBAD]   out%u %g %g %g %g%s\n", i,
+                s_xf[i].pos[0], s_xf[i].pos[1], s_xf[i].pos[2],
+                s_xf[i].pos[3], i == bad ? "  <- bad" : "");
+}
+
+/* ── Parallel vertex transform ───────────────────────────────────────────
+ *
+ * A title's 3D frame is one long run of vertices through the same program:
+ * the profile of a stage cutscene put nv2a_vsh_run and read_src at 37% of
+ * every host cycle in the process, and the guest sat in D3D's kickoff spin
+ * waiting for the walk to reach its next command while it ran. The program
+ * is read-only by then (its decoded form is built once, see
+ * vsh_ensure_code), attributes are plain reads of guest memory, and each
+ * vertex writes only its own output slot -- so the run splits across cores
+ * without a lock.
+ *
+ * Work is claimed in chunks rather than dealt in even shares: big vertices
+ * (a program with a matrix multiply per vertex) do not cost the same as
+ * small ones, and a fixed share leaves the caller waiting on one worker.
+ * The caller claims too, so a single-core build still makes progress.
+ * RECOMP_XF_THREADS sets the count (1 disables it).
+ */
+#define NV_XFP_MAX 8
+static struct {
+    CRITICAL_SECTION lock;
+    CONDITION_VARIABLE go, done;
+    INIT_ONCE once;
+    int n, gen, seen, running;
+    uint32_t next, end, chunk;
+    void (*fn)(void *ctx, uint32_t begin, uint32_t end);
+    void *ctx;
+    HANDLE th[NV_XFP_MAX];
+} s_xfp;
+
+static DWORD WINAPI xfp_worker(LPVOID arg);
+
+static BOOL CALLBACK xfp_once(PINIT_ONCE o, PVOID p, PVOID *c)
+{
+    const char *e;
+    long cores;
+    int n, k;
+
+    (void)o; (void)p; (void)c;
+    InitializeCriticalSection(&s_xfp.lock);
+    InitializeConditionVariable(&s_xfp.go);
+    InitializeConditionVariable(&s_xfp.done);
+    s_xfp.n = 1;
+#if defined(_WIN32)
+    { SYSTEM_INFO si; GetSystemInfo(&si); cores = (long)si.dwNumberOfProcessors; }
+#else
+    cores = sysconf(_SC_NPROCESSORS_ONLN);
+#endif
+    e = getenv("RECOMP_XF_THREADS");
+    n = e && *e ? atoi(e) : (int)cores - 1;
+    if (n < 1) n = 1;
+    if (n > NV_XFP_MAX) n = NV_XFP_MAX;
+    for (k = 1; k < n; k++) {
+        s_xfp.th[k] = CreateThread(NULL, 0, xfp_worker, (LPVOID)(intptr_t)k, 0, NULL);
+        if (!s_xfp.th[k])
+            break;              /* fewer than asked for: n is what started */
+    }
+    s_xfp.n = k;
+    return TRUE;
+}
+
+static void xfp_range(uint32_t count,
+                      void (*fn)(void *ctx, uint32_t begin, uint32_t end),
+                      void *ctx)
+{
+    InitOnceExecuteOnce(&s_xfp.once, xfp_once, NULL, NULL);
+    if (s_xfp.n <= 1 || count < 32) {
+        fn(ctx, 0, count);      /* one worker's worth: not worth a wake */
+        return;
+    }
+    EnterCriticalSection(&s_xfp.lock);
+    s_xfp.fn    = fn;
+    s_xfp.ctx   = ctx;
+    s_xfp.next  = 0;
+    s_xfp.end   = count;
+    s_xfp.chunk = count / (uint32_t)(s_xfp.n * 4u);
+    if (!s_xfp.chunk)
+        s_xfp.chunk = 1;
+    s_xfp.running = s_xfp.n - 1;
+    s_xfp.gen++;
+    WakeAllConditionVariable(&s_xfp.go);
+    LeaveCriticalSection(&s_xfp.lock);
+
+    for (;;) {                  /* the caller is a worker as well */
+        uint32_t b, e;
+        EnterCriticalSection(&s_xfp.lock);
+        b = s_xfp.next;
+        e = b + s_xfp.chunk;
+        if (e > s_xfp.end) e = s_xfp.end;
+        s_xfp.next = e;
+        LeaveCriticalSection(&s_xfp.lock);
+        if (b >= e)
+            break;
+        fn(ctx, b, e);
+    }
+    EnterCriticalSection(&s_xfp.lock);
+    while (s_xfp.running > 0)
+        SleepConditionVariableCS(&s_xfp.done, &s_xfp.lock, 100);
+    LeaveCriticalSection(&s_xfp.lock);
+}
+
+/* One worker: wait for a job generation, claim chunks until none are left,
+ * then count itself out. The caller waits for the last count. */
+static DWORD WINAPI xfp_worker(LPVOID arg)
+{
+    int seen = 0;
+    (void)arg;
+    for (;;) {
+        EnterCriticalSection(&s_xfp.lock);
+        while (s_xfp.gen == seen)
+            SleepConditionVariableCS(&s_xfp.go, &s_xfp.lock, 100);
+        seen = s_xfp.gen;
+        LeaveCriticalSection(&s_xfp.lock);
+        for (;;) {
+            uint32_t b, e;
+            EnterCriticalSection(&s_xfp.lock);
+            b = s_xfp.next;
+            e = b + s_xfp.chunk;
+            if (e > s_xfp.end) e = s_xfp.end;
+            s_xfp.next = e;
+            LeaveCriticalSection(&s_xfp.lock);
+            if (b >= e)
+                break;
+            s_xfp.fn(s_xfp.ctx, b, e);
+        }
+        EnterCriticalSection(&s_xfp.lock);
+        if (--s_xfp.running == 0)
+            WakeAllConditionVariable(&s_xfp.done);
+        LeaveCriticalSection(&s_xfp.lock);
+    }
+    return 0;
+}
+
+typedef struct {
+    Nv2aVshOutput *out;
+    uint32_t       base;            /* first index this job owns */
+} XfJob;
+
+static void xf_vertices(void *ctx, uint32_t begin, uint32_t end)
+{
+    const XfJob *j = (const XfJob *)ctx;
+    uint32_t i;
+
+    for (i = begin; i < end; i++) {
+        uint32_t k = j->base + i;
+        if (!transform_vertex(s_gpu.idx[k], &j->out[k]))
+            j->out[k].pos[3] = 0.0f;    /* cannot happen: checked before */
+    }
+}
+
 static void raster_batch_program(void)
 {
     uint32_t i, n = s_gpu.idx_count;
 
     if (!s_xf && !(s_xf = (Nv2aVshOutput *)calloc(NV_MAX_INDICES, sizeof *s_xf)))
         return;
-    for (i = 0; i < n; i++)
-        if (!transform_vertex(s_gpu.idx[i], &s_xf[i]))
-            return;                                    /* no program loaded */
+    /* The first vertex also answers "is there a program at all", before a
+     * pool of workers is woken for a batch that cannot be drawn. */
+    if (!transform_vertex(s_gpu.idx[0], &s_xf[0]))
+        return;                                        /* no program loaded */
+    if (n > 1) {
+        XfJob job = { s_xf, 1 };
+        xfp_range(n - 1, xf_vertices, &job);
+    }
+    xf_bad_report(n);
     xf_set_viewport();
     {
         const VertexAttr *tc = texcoord_attr();
@@ -3279,11 +3676,13 @@ static void draw_primitive(void)
     {
         uint32_t t0 = s_gpu.tris_drawn;
         uint64_t p0 = s_gpu.pixels;
+        uint64_t d0 = s_gpu.xf_depth_fail, f0 = s_gpu.xf_pixels;
         raster_batch();
         if (s_ftrace == 2) {
             fprintf(stderr, "[FTRACE] %s prim %u n %u surf %08X %ux%u+%u+%u"
                     " pitch %u | tex %s %08X %ux%u fmt %02X | blend %u %X/%X"
-                    " eq %X | z test %u func %X mask %u | tris %u px %llu\n",
+                    " eq %X | z test %u func %X mask %u | tris %u px %llu"
+                    " | cwrite %X dfail %llu pxf %llu\n",
                     (s_gpu.xf_mode & 3) == 2 ? "PRG" : "FIX", s_gpu.prim,
                     s_gpu.idx_count, s_gpu.color_offset, s_gpu.clip_w,
                     s_gpu.clip_h, s_gpu.clip_x, s_gpu.clip_y, s_gpu.pitch,
@@ -3293,7 +3692,10 @@ static void draw_primitive(void)
                     s_gpu.blend_dfactor, s_gpu.blend_equation,
                     s_gpu.depth_test, s_gpu.depth_func, s_gpu.depth_mask,
                     s_gpu.tris_drawn - t0,
-                    (unsigned long long)(s_gpu.pixels - p0));
+                    (unsigned long long)(s_gpu.pixels - p0),
+                    s_gpu.color_mask,
+                    (unsigned long long)(s_gpu.xf_depth_fail - d0),
+                    (unsigned long long)(s_gpu.xf_pixels - f0));
             if ((s_gpu.xf_mode & 3) == 2 && s_xf)
                 fprintf(stderr, "[FTRACE]     v0 %g %g %g %g  v1 %g %g  v2 %g %g%c",
                         s_xf[0].pos[0], s_xf[0].pos[1], s_xf[0].pos[2],
@@ -4000,9 +4402,11 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         break;
     case NV097_CLEAR_SURFACE:
         if (s_ftrace == 2)
-            fprintf(stderr, "[FTRACE] clear %X surf %08X %ux%u colour %08X%c",
+            fprintf(stderr, "[FTRACE] clear %X surf %08X %ux%u colour %08X"
+                            " z %08X (=%g) fmt %08X zeta %08X%c",
                     param, s_gpu.color_offset, s_gpu.clip_w, s_gpu.clip_h,
-                    s_gpu.clear_color, 10);
+                    s_gpu.clear_color, s_gpu.zstencil_clear,
+                    zclear_value(), s_gpu.format, s_gpu.zeta_offset, 10);
         clear_surface(param);
         if (param & 0x01)                         /* Z */
             zbuf_clear();
@@ -4140,6 +4544,11 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             xbox_FramebufferWindowFrameStats(s_gpu.draws - draws_at_flip);
             draws_at_flip = s_gpu.draws;
         }
+        /* A back end writes the finished frame back into the title's colour
+         * surface, so it has to run before the present below reads that
+         * surface -- otherwise the window shows the previous frame. */
+        if (s_backend && s_backend->flip)
+            s_backend->flip();
         if (s_gpu.pitch) {
             extern void xbox_FramebufferWindowPresent(uint32_t, uint32_t);
             uint32_t done = s_gpu.drawn_offset ? s_gpu.drawn_offset
@@ -4174,8 +4583,6 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             }
         }
         s_gpu.drawn_stale = 1;
-        if (s_backend && s_backend->flip)
-            s_backend->flip();
 
         if (verbose) {
             static unsigned n;
@@ -4489,16 +4896,19 @@ void nv2a_pb_exec_report(void)
     int i, j;
 
     {
-        /* Frames per second of guest time, from flips between reports. */
+        /* Frames per second, from flips between reports. Wall time, not
+         * clock(): clock() is CPU time summed over every thread, so a
+         * rasteriser that got faster by using more cores read as slower.
+         * The line said 0.77 fps while the title actually flipped at 13.7. */
         static uint32_t last_flips;
-        static unsigned long last_ms;
-        unsigned long now = (unsigned long)(clock() * 1000.0 / CLOCKS_PER_SEC);
-        if (last_ms && now > last_ms)
+        static uint64_t last_ns;
+        uint64_t now = xbox_HostNowNs();
+        if (last_ns && now > last_ns)
             fprintf(stderr, "[GPU] %.2f fps (%u flips)%c",
-                    (s_gpu.flips - last_flips) * 1000.0 / (now - last_ms),
+                    (s_gpu.flips - last_flips) * 1e9 / (double)(now - last_ns),
                     s_gpu.flips, 10);
         last_flips = s_gpu.flips;
-        last_ms = now;
+        last_ns = now;
     }
     flip_hold_report();
     fprintf(stderr, "[GPU] surface 0x%08X pitch %u clip %ux%u+%u+%u"
@@ -4528,6 +4938,10 @@ void nv2a_pb_exec_report(void)
                     " screen-space, %u triangles fully off-surface\n",
             s_gpu.tris_drawn, s_gpu.batches_untransformed,
             s_gpu.tris_skipped_offscreen);
+    fprintf(stderr, "[GPU] transforms: %u vertices off-screen/NaN in %u batches"
+                    " (%u batches entirely bad)\n", s_gpu.xf_bad_verts,
+            s_gpu.xf_bad_batches_some + s_gpu.xf_bad_batches_all,
+            s_gpu.xf_bad_batches_all);
     fprintf(stderr, "[GPU] vertex programs: %u batches, %u vertices;"
                     " %u triangles dropped behind the eye\n",
             s_gpu.batches_program, s_gpu.verts_program, s_gpu.tris_behind);
