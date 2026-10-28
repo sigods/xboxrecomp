@@ -536,7 +536,13 @@ static void target_bind(GlTarget *t, const Nv2aSurface *s)
 /* ── Textures ───────────────────────────────────────────────────────────── */
 
 typedef struct {
-    uint32_t offset, w, h, fmt, levels;
+    /* `pitch` is part of the identity, not decoration: for a linear format it
+     * is the row stride the decoder walks, so the same offset and size bound
+     * with a different pitch is a different image. Otogi binds its 640x480
+     * A8R8G8B8 surfaces this way (pitch 2560), and a cache that ignored the
+     * field would keep the first decode of an offset that a later bind reads
+     * at another stride. */
+    uint32_t offset, w, h, fmt, levels, pitch;
     GLuint   tex;
     uint64_t stamp;
 } GlTex;
@@ -552,7 +558,7 @@ static GlTex *tex_find(const Nv2aTexture *t)
         GlTex *e = &s_tex[i];
         if (e->tex && e->offset == t->offset && e->w == t->width
             && e->h == t->height && e->fmt == t->color
-            && e->levels == t->levels)
+            && e->levels == t->levels && e->pitch == t->pitch)
             return e;
     }
     return NULL;
@@ -622,6 +628,7 @@ static int tex_upload(GlTex *e, const Nv2aTexture *t)
     e->h = t->height;
     e->fmt = t->color;
     e->levels = t->levels;
+    e->pitch = t->pitch;
     e->stamp = ++s_tex_clock;
     if (s_verbose)
         fprintf(stderr, "[PBGL] upload %08X %ux%u fmt %02X\n",

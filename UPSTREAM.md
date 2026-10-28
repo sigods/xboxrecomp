@@ -98,6 +98,14 @@ an ordinary clone.
   covered. The box is only computed when the record is about to be printed or
   hashed, so nothing changes unless `RECOMP_GL_COMB`/`_COMB3` is set.
 
+- `src/nv2a/nv2a_pb_gl.c`, texture cache — `GlTex` now carries `pitch`, and
+  `tex_find()` matches on it. For a linear format the pitch is the row stride
+  the decoder walks, so the same offset and size bound with another pitch is a
+  different image; without the field the cache kept the first decode of an
+  offset a later bind reads at a different stride (Otogi binds its 640x480
+  `A8R8G8B8` surfaces with pitch 2560). `tex_upload()` stores it alongside
+  offset/size/format/levels.
+
 ## Updating
 
 The submodule tracks our fork, so a rebase is a branch operation in
