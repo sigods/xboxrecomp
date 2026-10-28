@@ -89,6 +89,15 @@ an ordinary clone.
   `RECOMP_GL_NO_CULL=1` restoring both on the same capture
   (`docs/BOOT_LOG.md`, 2026-10-28).
 
+- `src/nv2a/nv2a_pb_gl.c`, `comb_report()` — the `[GLCOMB]` record now ends
+  with the batch's screen box (`box x0..x1 y0..y1`) and the duplicate check
+  hashes that box, quantised to 32 pixels, alongside the combiner state.
+  Without it a frame full of six-vertex sprites reports one record per
+  *combiner*, so a suspect quad could not be matched to its position: Otogi's
+  transition frame has a pure-white rectangle at +499+309 that no record
+  covered. The box is only computed when the record is about to be printed or
+  hashed, so nothing changes unless `RECOMP_GL_COMB`/`_COMB3` is set.
+
 ## Updating
 
 The submodule tracks our fork, so a rebase is a branch operation in

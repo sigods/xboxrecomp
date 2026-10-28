@@ -1021,6 +1021,7 @@ static void comb_report(const Nv2aBatch *b, const Nv2aVertex *v)
     const Nv2aCombiner *rc = b->combiner;
     uint32_t h, i;
     int s, dup = 0, two_d;
+    float x0, y0, x1, y1;
 
     if (left < 0) {
         const char *e = getenv("RECOMP_GL_COMB");
@@ -1041,6 +1042,22 @@ static void comb_report(const Nv2aBatch *b, const Nv2aVertex *v)
     two_d = v->z == 0.0f && v->rhw == 1.0f;
     if (two_d ? left <= 0 : (left3 <= 0 || b->count < (uint32_t)min3))
         return;
+    /* The batch's screen box, computed before the duplicate check so two
+     * sprites that share a combiner but sit in different places are reported
+     * apart: "the white rectangle at the lower right" has to be matchable,
+     * and this is the only place the batch's vertices are in hand. */
+    x0 = y0 = 1e30f;
+    x1 = y1 = -1e30f;
+    for (i = 0; i < b->count; i++) {
+        const Nv2aVertex *p = &b->vertices[i];
+        if (p->x != p->x || p->y != p->y)
+            continue;                           /* NaN: no box from this one */
+        if (p->x < x0) x0 = p->x;
+        if (p->y < y0) y0 = p->y;
+        if (p->x > x1) x1 = p->x;
+        if (p->y > y1) y1 = p->y;
+    }
+    if (x0 > x1) { x0 = x1 = y0 = y1 = 0.0f; }
     h = 2166136261u;
     for (i = 0; i < 8; i++)
         h = (h ^ rc->color_icw[i]) * 16777619u;
@@ -1053,6 +1070,8 @@ static void comb_report(const Nv2aBatch *b, const Nv2aVertex *v)
     h = (h ^ rc->factor0[0]) * 16777619u;
     h = (h ^ rc->factor1[0]) * 16777619u;
     h = (h ^ (two_d ? 1u : 2u)) * 16777619u;   /* the two are reported apart */
+    h = (h ^ (uint32_t)(x0 / 32.0f) * 73856093u) * 16777619u;
+    h = (h ^ (uint32_t)(y0 / 32.0f) * 19349663u) * 16777619u;
     for (i = 0; i < (uint32_t)nseen; i++)
         if (seen[i] == h) dup = 1;
     if (dup)
@@ -1065,10 +1084,10 @@ static void comb_report(const Nv2aBatch *b, const Nv2aVertex *v)
         left3--;
     fprintf(stderr, "[GLCOMB] batch n %u col %08X spec %08X uv %g %g"
                     " fogf %g stpar %08X ctl %08X final %08X/%08X"
-                    " f0 %08X f1 %08X fog %08X\n",
+                    " f0 %08X f1 %08X fog %08X box %.0f..%.0f %.0f..%.0f\n",
             b->count, v->diffuse, v->specular, v->u, v->v, v->fogf,
             rc->stage_program, rc->control, rc->final0, rc->final1,
-            rc->final_c0, rc->final_c1, b->fog_color);
+            rc->final_c0, rc->final_c1, b->fog_color, x0, x1, y0, y1);
     for (s = 0; s < 8; s++)
         fprintf(stderr, "[GLCOMB]   stage %d c %08X/%08X a %08X/%08X"
                         " fac %08X %08X\n", s, rc->color_icw[s],
