@@ -2556,8 +2556,22 @@ static int rc_stage_fetch(int st, const float c[4], float out[4])
     }
 }
 
-/* The fixed-function fog unit, per vertex, from the program's oFog.x
- * (xemu vsh.c). Fog disabled reads as factor 1: no fog. */
+/* The fixed-function fog unit, per vertex, from the program's oFog.x.
+ *
+ * The unit computes `fog_param0 + coord * fog_param1` and saturates. It used
+ * to subtract a constant from that result (1.0 linear, 1.5 exponential),
+ * which is what Otogi caught: the title enables fog, leaves both params at
+ * 1.0, and writes its own factor into oFog -- so the subtraction turned the
+ * program's oFog straight into the fog factor and fogged a scene the title
+ * leaves unfogged. RECOMP_FOG_TRACE=60 shows it as it happened:
+ *   [FOG] mode 2601 en 1 px 1 py 1 d -nan -> f 1
+ * With the offset, px = py = 1 gives f = d; hardware saturates 1 + d to 1,
+ * i.e. no fog, which is what the title wanted the whole time. The stage's
+ * ground and foliage are what the subtraction was painting the fog colour.
+ *
+ * Only the linear path is changed: Otogi runs mode 0x2601 (LINEAR) and there
+ * is no capture here of a title whose exponential params depend on the
+ * 1.5 constant. Fog disabled reads as factor 1: no fog. */
 static float fog_factor(float d)
 {
     float f, px = s_gpu.fog_param[0], py = s_gpu.fog_param[1];
@@ -2580,7 +2594,7 @@ static float fog_factor(float d)
         f = px + exp2f(-d * d * py * py * 32.0f) - 1.5f;
         break;
     default:                                      /* LINEAR, LINEAR_ABS */
-        f = px + d * py - 1.0f;
+        f = px + d * py;
         break;
     }
     if (s_gpu.fog_mode == 0x802 || s_gpu.fog_mode == 0x803
@@ -2588,6 +2602,24 @@ static float fog_factor(float d)
         f = fabsf(f);
     if (f != f)
         f = 1.0f;
+    /* RECOMP_FOG_TRACE=<n>: the first n fog evaluations -- mode, the two
+     * SET_FOG_PARAMS values, the distance the program wrote and the factor
+     * that came out. A stage that reads as a blue wash is either a factor
+     * that never clears or a factor that clears too early, and only the two
+     * ends and the distance say which. */
+    {
+        static int left = -1;
+        if (left < 0) {
+            const char *e = getenv("RECOMP_FOG_TRACE");
+            left = e ? atoi(e) : 0;
+        }
+        if (left > 0) {
+            left--;
+            fprintf(stderr, "[FOG] mode %X en %u px %g py %g d %g -> f %g\n",
+                    s_gpu.fog_mode, s_gpu.fog_enable, px, py, d,
+                    f < 0.0f ? 0.0f : (f > 1.0f ? 1.0f : f));
+        }
+    }
     return f < 0.0f ? 0.0f : (f > 1.0f ? 1.0f : f);
 }
 
