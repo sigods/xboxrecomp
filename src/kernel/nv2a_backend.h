@@ -20,14 +20,19 @@
  * so a back end only ever sees surface pixels. Blend, depth, alpha, cull and
  * stencil state arrive in Nv2aRenderState.
  *
- * ponytail: register-combiner state and texture stages 1-3 are not passed on:
- * a back end sees stage 0 and the diffuse colour. Extend Nv2aBatch when that
- * matters rather than adding callbacks.
+ * A batch carries the register-combiner state (nv2a_combiner.h) and every
+ * texture stage the title programmed, so a back end can evaluate the pixel
+ * stage the way the CPU rasteriser does. "Diffuse times stage 0" is not the
+ * same function: it paints opaque black where a title's combiner takes the
+ * colour from the alpha channel, which is what a menu's text and a stage's
+ * black props are made of.
  */
 #ifndef NV2A_BACKEND_H
 #define NV2A_BACKEND_H
 
 #include <stdint.h>
+
+#include "nv2a_combiner.h"
 
 /* The colour surface being drawn into, in real (anti-aliased) pixels.
  * aa_sx/aa_sy give the anti-aliasing factor, so width/aa_sx is the logical
@@ -61,8 +66,16 @@ typedef struct {
 typedef struct {
     float    x, y, z;           /* surface pixels; z as the title produced it */
     float    rhw;               /* 1/w, 1 for pre-transformed batches */
-    uint32_t diffuse;           /* 0xAARRGGBB */
-    float    u, v;              /* texels */
+    uint32_t diffuse;           /* 0xAARRGGBB: the combiners' v0 */
+    float    u, v;              /* stage 0 coordinates, in texels */
+    /* Colour 1 (D3D's specular) and the fog factor: the combiners' v1 and
+     * fog inputs. The CPU rasteriser interpolates them for exactly this. */
+    uint32_t specular;          /* 0xAARRGGBB */
+    float    fogf;
+    /* Every stage's texture coordinates, in texels, w carrying the stage's
+     * q (the CPU path divides by it). st[0] repeats u/v for a back end that
+     * only samples stage 0. */
+    float    st[4][4];
 } Nv2aVertex;
 
 /* Render state as the title set it, in NV2A's own (OpenGL) enum values:
@@ -95,8 +108,25 @@ typedef struct {
 typedef struct {
     const Nv2aVertex  *vertices;    /* triangle list: count is a multiple of 3 */
     uint32_t           count;
-    const Nv2aTexture *texture;     /* NULL: untextured */
+    const Nv2aTexture *texture;     /* stage 0; NULL: untextured */
+    /* One entry per stage, NULL where the title has none programmed. A title
+     * composites its scene through a second stage (Burnout 3) and blends two
+     * textures in its HUD; both read t1..t3 in the combiners. */
+    const Nv2aTexture *textures[4];
     const Nv2aRenderState *state;
+    /* The register-combiner state in force when the batch was submitted, or
+     * NULL if the title never programmed any -- in which case modulating the
+     * pixel by stage 0 is the whole of the pixel stage, as it is for the CPU
+     * rasteriser's fallback. */
+    const Nv2aCombiner   *combiner;
+    /* SET_COMBINER_FOG_COLOR as the register holds it: R in the low byte, the
+     * reverse of a D3DCOLOR (nv2a_combiner.h's inputs are r,g,b,a floats). */
+    uint32_t              fog_color;
+    /* SET_CLIP_PLANE_MODE: one nibble per stage per coordinate channel, the
+     * compare the clip-plane stage (SHADER_STAGE_PROGRAM 5) applies to each.
+     * That stage kills the pixel rather than shading it, so a back end that
+     * has to know it. Zero when the title never wrote the register. */
+    uint32_t              clip_plane_mode;
 } Nv2aBatch;
 
 typedef struct {

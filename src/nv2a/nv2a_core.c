@@ -490,6 +490,28 @@ void pvideo_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
 {
     NV2AState *d = (NV2AState *)opaque;
     nv2a_reg_log_write(NV_PVIDEO, addr, size, val);
+    /* Which titles run a movie through the overlay, and what they asked for.
+     * Nothing else says: PVIDEO is only composited where a presenter runs
+     * (fb_present.c), so a headless capture of a title's attract movie is
+     * black either because the overlay is doing its job off-screen or because
+     * the title never programmed it -- and those two look identical. First
+     * few banks only: a playing movie programs one per frame. */
+    if (addr == NV_PVIDEO_BUFFER && (val & 0x11u)) {
+        static int pv_seen;
+        if (pv_seen++ < 4)
+            fprintf(stderr,
+                    "[PVIDEO] bank on val=%08X OFFSET=%08X BASE=%08X "
+                    "SIZE_IN=%08X POINT_IN=%08X SIZE_OUT=%08X "
+                    "POINT_OUT=%08X FORMAT=%08X\n",
+                    (unsigned)val,
+                    (unsigned)d->pvideo.regs[NV_PVIDEO_OFFSET],
+                    (unsigned)d->pvideo.regs[NV_PVIDEO_BASE],
+                    (unsigned)d->pvideo.regs[NV_PVIDEO_SIZE_IN],
+                    (unsigned)d->pvideo.regs[NV_PVIDEO_POINT_IN],
+                    (unsigned)d->pvideo.regs[NV_PVIDEO_SIZE_OUT],
+                    (unsigned)d->pvideo.regs[NV_PVIDEO_POINT_OUT],
+                    (unsigned)d->pvideo.regs[NV_PVIDEO_FORMAT]);
+    }
     /* STOP is a command, not storage. The title's D3D waits for the pending
      * banks in BUFFER to clear after issuing it; xemu clears them at once. */
     if (addr == NV_PVIDEO_STOP) {

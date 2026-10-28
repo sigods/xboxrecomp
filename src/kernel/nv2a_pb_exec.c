@@ -248,6 +248,8 @@ typedef struct {
     uint32_t type;        /* NV097 data type nibble */
     uint32_t size;        /* components per element */
     uint32_t stride;      /* bytes between elements */
+    uint32_t raw_fmt;     /* the SET_..ARRAY_FORMAT word, undecoded   */
+    uint32_t raw_off;     /* the SET_..ARRAY_OFFSET word, raw too    */
 } VertexAttr;
 
 #define NV_VERTEX_ATTRS 16
@@ -347,6 +349,19 @@ static struct {
     uint32_t batches_program, verts_program, tris_behind;
     /* Where program-path triangles go, so "nothing drew" has a reason. */
     uint32_t xf_degenerate, xf_offscreen, xf_drawn;
+    /* Batches that reached the rasteriser and lost every triangle to the
+     * three drop sites (behind the eye, degenerate, clipped) -- the flat
+     * batches RECOMP_XF_FLAT reports on, counted for the census. */
+    uint32_t xf_flat_batches;
+    uint32_t xf_flat_behind, xf_flat_degen, xf_flat_mixed, xf_flat_onscreen;
+    /* Triangles handed to a back end, split by whether their bounding box
+     * touches the clip window. "World missing while 50M triangles claim to
+     * be rasterised" is answered here: off-screen means the transform put
+     * them somewhere no screen shows, on-screen means they drew and the
+     * problem is colour or depth. */
+    uint32_t xf_be_on, xf_be_off;
+    float xf_be_min[2], xf_be_max[2];
+    int xf_be_seeded;
     uint64_t xf_depth_fail, xf_pixels;
     float xf_min[3], xf_max[3];
     uint32_t xf_fmt[16];  /* attribute formats seen: type | size<<4 | slot<<8 */
@@ -1195,6 +1210,7 @@ static uint32_t linear_twin(uint32_t fmt)
     case 0x06: return 0x12;                /* A8R8G8B8  -> LIN_A8R8G8B8  */
     case 0x07: return 0x1E;                /* X8R8G8B8  -> LIN_X8R8G8B8  */
     case 0x19: return 0x1F;                /* A8        -> LIN_A8        */
+    case 0x28: return 0x17;                /* G8B8      -> LIN_G8B8      */
     default:   return fmt;                 /* already linear, or unhandled */
     }
 }
@@ -1338,6 +1354,23 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
               | (expand((t >>  8) & 0x0F, 4) << 16)
               | (expand((t >>  4) & 0x0F, 4) <<  8)
               |  expand( t        & 0x0F, 4);
+        return 1;
+    }
+    case 0x17: {                                    /* LIN_G8B8 */
+        /* Two channels and no alpha: green in the high byte, blue in the
+         * low, red absent. The name reads high-to-low like every other one
+         * in this switch (X8L8V8U8, A16B16G16R16), so the word is G in bits
+         * 8-15 and B in 0-7.
+         *
+         * Otogi's effect planes -- the light shafts and cloud cards -- are a
+         * 256x256 texture in this format, and until it decoded the OpenGL back
+         * end got a hard failure there and bound white instead: a quad with an
+         * opaque alpha channel where the title's combiner wants this texel's
+         * own. That is the hard-edged wedge in KNOWN_ISSUES.md. Alpha is the
+         * one thing the format does not carry, so it is 0xFF here and the
+         * combiner takes the channels it selects from what is present. */
+        uint32_t t = ((const uint16_t *)p)[u];
+        *argb = 0xFF000000u | ((t >> 8) & 0xFF00u) | (t & 0xFFu);
         return 1;
     }
 
@@ -2066,6 +2099,10 @@ static Nv2aVertex *backend_slot(void)
     return &s_bverts[s_bcount];
 }
 
+/* Defined with the CPU rasteriser's fog input, below; the back end's vertex
+ * carries the same factor. */
+static float fog_factor(float f);
+
 static void backend_from_xf(const Nv2aVshOutput *v, Nv2aVertex *o)
 {
     float su = 1.0f, sv = 1.0f;
@@ -2081,6 +2118,17 @@ static void backend_from_xf(const Nv2aVshOutput *v, Nv2aVertex *o)
     o->diffuse = pack_color(v->d0);
     o->u = v->tex[0][0] * su;
     o->v = v->tex[0][1] * sv;
+    /* The rest of what a register combiner reads per vertex: colour 1, the
+     * fog factor, and every stage's coordinates (the CPU path builds the same
+     * set just before it evaluates the combiners). */
+    o->specular = pack_color(v->d1);
+    o->fogf = fog_factor(v->fog[0]);
+    {
+        int st, j;
+        for (st = 0; st < 4; st++)
+            for (j = 0; j < 4; j++)
+                o->st[st][j] = v->tex[st][j];
+    }
 }
 
 /* `textured`: the batch carried texture coordinates, so the bound texture is
@@ -2090,16 +2138,63 @@ static void backend_flush(int textured)
     Nv2aSurface surf;
     Nv2aRenderState rs;
     Nv2aTexture tex;
+    Nv2aTexture stages[4];
     Nv2aBatch batch;
+    int i;
 
     if (!s_bcount)
         return;
     memset(&surf, 0, sizeof surf);
     memset(&rs, 0, sizeof rs);
     memset(&tex, 0, sizeof tex);
+    memset(stages, 0, sizeof stages);
     memset(&batch, 0, sizeof batch);
     current_surface(&surf);
     current_render_state(&rs);
+    /* RECOMP_GL_STATE=<n>: the render state the back end receives -- the
+     * first few batches of every stage frame (what gets drawn right after
+     * the clear, and with what depth write) plus a modulo spread, n total.
+     * "Cull or depth eats the world" says which gate; this says what the
+     * gate was set to and how near the first depth writers are. */
+    {
+        static int left = -1, fleft;
+        static long at = -1;
+        static uint32_t last_flips;
+        if (left < 0) {
+            const char *e = getenv("RECOMP_GL_STATE");
+            left = e ? atoi(e) : 0;
+            e = getenv("RECOMP_GL_STATE_AT");
+            at = e ? atol(e) : 0;      /* report only from this batch id on */
+        }
+        if (s_gpu.flips != last_flips) {
+            last_flips = s_gpu.flips;
+            fleft = 3;
+        }
+        if (left > 0 && (long)s_gpu.batches_program >= at
+            && (fleft > 0 || s_gpu.batches_program % 211 == 0)) {
+            if (fleft > 0)
+                fleft--;
+            left--;
+            fprintf(stderr, "[GLST] batch %u flip %u n %u depth %d func %X"
+                            " wmask %d | cull %d face %X front %X"
+                            " | blend %d %X/%X alpha %d %X ref %u"
+                            " mask %08X zfmt %X | v0 %g %g z %g rhw %g"
+                            " col %08X uv %g %g\n",
+                    s_gpu.batches_program, s_gpu.flips, s_bcount,
+                    rs.depth_test_enable, rs.depth_func, rs.depth_write,
+                    rs.cull_enable, rs.cull_face, rs.front_face,
+                    rs.blend_enable, rs.blend_src, rs.blend_dst,
+                    rs.alpha_test_enable, rs.alpha_func,
+                    rs.alpha_ref, rs.color_mask, rs.zeta_format,
+                    s_bcount ? s_bverts[0].x : 0.0f,
+                    s_bcount ? s_bverts[0].y : 0.0f,
+                    s_bcount ? s_bverts[0].z : 0.0f,
+                    s_bcount ? s_bverts[0].rhw : 0.0f,
+                    s_bcount ? s_bverts[0].diffuse : 0,
+                    s_bcount ? s_bverts[0].u : 0.0f,
+                    s_bcount ? s_bverts[0].v : 0.0f);
+        }
+    }
     batch.vertices = s_bverts;
     batch.count = s_bcount;
     batch.texture = NULL;
@@ -2116,6 +2211,32 @@ static void backend_flush(int textured)
         tex.filter = s_gpu.texs[0].filter;
         batch.texture = &tex;
     }
+    /* Stage 0 comes first in both shapes so that a back end that only samples
+     * stage 0 reads the same texture it always did. */
+    batch.textures[0] = batch.texture;
+    if (textured) {
+        for (i = 1; i < 4; i++) {
+            if (!s_gpu.texs[i].valid)
+                continue;
+            stages[i] = tex;                   /* same shape, this stage */
+            stages[i].offset = s_gpu.texs[i].offset;
+            stages[i].width  = s_gpu.texs[i].width;
+            stages[i].height = s_gpu.texs[i].height;
+            stages[i].pitch  = s_gpu.texs[i].pitch;
+            stages[i].color  = s_gpu.texs[i].color;
+            stages[i].addr_u = s_gpu.texs[i].addr_u;
+            stages[i].addr_v = s_gpu.texs[i].addr_v;
+            stages[i].levels = s_gpu.texs[i].pitch ? 1 : s_gpu.texs[i].levels;
+            stages[i].filter = s_gpu.texs[i].filter;
+            batch.textures[i] = &stages[i];
+        }
+    }
+    /* The combiners, unless the title never sent one (then the pixel stage is
+     * the back end's own modulate, exactly as the CPU path falls back).
+     * s_gpu.rc is the same state the CPU rasteriser evaluates. */
+    batch.combiner = s_gpu.rc_seen ? &s_gpu.rc : NULL;
+    batch.fog_color = s_gpu.fog_color;
+    batch.clip_plane_mode = s_gpu.clip_plane_mode;
     s_backend->draw(&surf, &batch);
     s_gpu.tris_drawn += s_bcount / 3;
     s_bcount = 0;
@@ -2160,6 +2281,25 @@ static void raster_indexed(uint32_t i0, uint32_t i1, uint32_t i2, uint32_t argb)
             o[k].diffuse = vertex_color(ix[k]);
             o[k].u = textured ? uv[k][0] : 0.0f;
             o[k].v = textured ? uv[k][1] : 0.0f;
+            /* The rest of the shape a back end reads per vertex. Left unset
+             * they hold the previous batch's values -- s_bverts is reused, not
+             * cleared -- and a combiner that samples stage 0 then samples
+             * whatever coordinate the batch before it left behind. A
+             * screen-space batch has no program inputs: one texture stage, no
+             * fog coordinate, no second colour. */
+            o[k].specular = 0xFFFFFFFFu;
+            o[k].fogf = 1.0f;
+            memset(o[k].st, 0, sizeof o[k].st);
+            if (textured) {
+                float su = (float)s_gpu.texs[0].width;
+                float sv = (float)s_gpu.texs[0].height;
+
+                if (!su) su = 1.0f;
+                if (!sv) sv = 1.0f;
+                o[k].st[0][0] = uv[k][0] / su;
+                o[k].st[0][1] = uv[k][1] / sv;
+                o[k].st[0][2] = 1.0f;
+            }
         }
         s_bcount += 3;
         return;
@@ -2857,6 +2997,13 @@ static void xf_queue_push(const XfTri *T)
     s_xfq_px += (long)(T->maxx - T->minx) * (T->maxy - T->miny);
 }
 
+/* Why one batch produced nothing: counted per batch so a batch whose every
+ * triangle collapsed (the 41.5M "degenerate/NaN" in the report) can be told
+ * apart from a scene that is merely sparse. Reset at the top of each batch,
+ * read at the bottom; only the executor thread writes it. */
+static uint32_t s_b_ok, s_b_fail;
+static uint32_t s_b_behind, s_b_degen, s_b_clip;   /* fail reasons */
+
 static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
                                const Nv2aVshOutput *vc)
 {
@@ -2884,20 +3031,63 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
         return;
     if (a[3] <= 0.0f || b[3] <= 0.0f || c[3] <= 0.0f) {
         s_gpu.tris_behind++;
+        s_b_fail++;
+        s_b_behind++;
         return;
     }
     area = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
     if (area == 0.0f || area != area) {
         s_gpu.xf_degenerate++;
+        s_b_fail++;
+        s_b_degen++;
         return;
     }
     if (backend_draws()) {                     /* a back end rasterises */
         Nv2aVertex *o = backend_slot();
         if (o) {
+            float lo, hi;
             backend_from_xf(va, &o[0]);
             backend_from_xf(vb, &o[1]);
             backend_from_xf(vc, &o[2]);
             s_bcount += 3;
+            s_b_ok++;
+            /* On the window or not: GL clips what misses it silently, so
+             * this is the only place "drawn" can be told from "visible". */
+            lo = fminf(a[0], fminf(b[0], c[0]));
+            hi = fmaxf(a[0], fmaxf(b[0], c[0]));
+            if (hi < (float)s_gpu.clip_x
+             || lo > (float)(s_gpu.clip_x + s_gpu.clip_w))
+                s_gpu.xf_be_off++;
+            else {
+                lo = fminf(a[1], fminf(b[1], c[1]));
+                hi = fmaxf(a[1], fmaxf(b[1], c[1]));
+                if (hi < (float)s_gpu.clip_y
+                 || lo > (float)(s_gpu.clip_y + s_gpu.clip_h))
+                    s_gpu.xf_be_off++;
+                else
+                    s_gpu.xf_be_on++;
+            }
+            /* Finite bounds of everything submitted: a min in the e38s is
+             * an uninitialised vertex, not a scene. */
+            {
+                const float *ps[3] = { a, b, c };
+                int j;
+                for (j = 0; j < 3; j++) {
+                    int d;
+                    for (d = 0; d < 2; d++) {
+                        float v = ps[j][d];
+                        if (!isfinite(v))
+                            continue;
+                        if (!s_gpu.xf_be_seeded) {
+                            s_gpu.xf_be_min[0] = s_gpu.xf_be_max[0] = a[0];
+                            s_gpu.xf_be_min[1] = s_gpu.xf_be_max[1] = a[1];
+                            s_gpu.xf_be_seeded = 1;
+                        }
+                        if (v < s_gpu.xf_be_min[d]) s_gpu.xf_be_min[d] = v;
+                        if (v > s_gpu.xf_be_max[d]) s_gpu.xf_be_max[d] = v;
+                    }
+                }
+            }
         }
         return;
     }
@@ -2951,6 +3141,7 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
     }
     s_gpu.xf_drawn++;
     T.inv_area = 1.0f / area;
+    s_b_ok++;
 
     xf_queue_push(&T);
     (void)cnt;
@@ -3069,6 +3260,8 @@ static void raster_xf_clipped(const Nv2aVshOutput *a, const Nv2aVshOutput *b,
         memcpy(p0, p1, sizeof p1);
     if (n < 3) {
         s_gpu.tris_behind++;                  /* wholly clipped away */
+        s_b_fail++;
+        s_b_clip++;
         return;
     }
     /* Back to screen space: divide by the (now positive) w. */
@@ -3087,11 +3280,19 @@ static Nv2aVshOutput *s_xf;
  * interpreter off (the batch then falls to the screen-space heuristics). */
 static int batch_uses_program(void)
 {
-    static int no_vsh = -1;
+    static int no_vsh = -1, always = -1;
 
-    if (no_vsh < 0)
+    if (no_vsh < 0) {
         no_vsh = getenv("RECOMP_NO_VSH") != NULL;
-    return (s_gpu.xf_mode & 3) == 2 && !no_vsh;
+        /* RECOMP_VSH_ALWAYS: run the loaded program whatever
+         * SET_TRANSFORM_EXECUTION_MODE says. Otogi's fixed-function batches
+         * (MODE 0) arrive with no composite, projection or model-view matrix
+         * anywhere -- not as a method, not in the transform constant file --
+         * so there is no fixed-function transform to perform, and the only
+         * per-draw transform data it uploads is a vertex program. */
+        always = getenv("RECOMP_VSH_ALWAYS") != NULL;
+    }
+    return !no_vsh && (always || (s_gpu.xf_mode & 3) == 2);
 }
 
 static int transform_vertex(uint32_t index, Nv2aVshOutput *out)
@@ -3120,8 +3321,16 @@ static int transform_vertex(uint32_t index, Nv2aVshOutput *out)
         else
             fetch_attr(&s_gpu.attr[a], index, in[a]);   /* absent: 0,0,0,1 */
     }
-    if (!nv2a_vsh_run((const float (*)[4])in, out))
+    if (!nv2a_vsh_run((const float (*)[4])in, out)) {
+        /* No program loaded. With RECOMP_VSH_ALWAYS the batch was only here
+         * because the mode said so; fall back rather than drop it. */
+        static int always = -1;
+        if (always < 0)
+            always = getenv("RECOMP_VSH_ALWAYS") != NULL;
+        if (always)
+            return ffp_vertex(index, out);
         return 0;
+    }
     /* oPos.w == 0 comes from a program that never divided by w: x, y and z
      * are already surface units. The hardware draws such a vertex (xemu
      * clamps w away from zero, in front of the eye), but raster_xf_clipped
@@ -3156,6 +3365,7 @@ static void xf_set_viewport(void)
 static void xf_bad_report(uint32_t n)
 {
     static int left = -1;
+    static long at = -1;
     uint32_t i, bad = n, nbad = 0;
 
     /* Only x and y: z is already depth-buffer units, and the viewport's z
@@ -3180,8 +3390,12 @@ static void xf_bad_report(uint32_t n)
     if (left < 0) {
         const char *e = getenv("RECOMP_XF_BAD");
         left = e ? atoi(e) : 0;
+        e = getenv("RECOMP_XF_BAD_AT");
+        at = e ? atol(e) : 0;    /* report only from this batch id on */
     }
     if (left <= 0 || !nbad)
+        return;
+    if ((long)(s_gpu.batches_program + s_gpu.batches_ffp) < at)
         return;
     left--;
     fprintf(stderr, "[XFBAD] batch %u prim %u n %u mode 0x%X idx %u %u %u"
@@ -3211,6 +3425,149 @@ static void xf_bad_report(uint32_t n)
         fprintf(stderr, "[XFBAD]   out%u %g %g %g %g%s\n", i,
                 s_xf[i].pos[0], s_xf[i].pos[1], s_xf[i].pos[2],
                 s_xf[i].pos[3], i == bad ? "  <- bad" : "");
+}
+
+/* RECOMP_XF_FLAT=<n>: report the first n batches that reached the
+ * rasteriser and lost every triangle. The census says 26.9M triangles went
+ * behind the eye; this says whether they died evenly across a scene that is
+ * merely behind the camera, or in whole batches -- a batch all of whose
+ * triangles fail has a wrong transform (a matrix, a near plane, a w), not
+ * bad luck, and the batch id is what a second run with RECOMP_XF_BAD=
+ * "1 0x..." can pick up on. Counted either way; printed while n lasts. */
+static void xf_flat_report(uint32_t n)
+{
+    static int left = -1;
+    static long at = -1;
+    uint32_t i;
+
+    if (!s_b_fail || s_b_ok)
+        return;
+    s_gpu.xf_flat_batches++;
+    if (s_b_behind + s_b_clip == s_b_fail)   /* eye or near plane */
+        s_gpu.xf_flat_behind++;
+    else if (s_b_degen == s_b_fail)
+        s_gpu.xf_flat_degen++;
+    else
+        s_gpu.xf_flat_mixed++;
+    /* Only the batches that lost everything *on screen* are interesting: a
+     * batch behind the eye or off the window is the title culling its own
+     * geometry, and it is most of the flat count. Where the survivors of a
+     * collapse land says which this is -- reading a healthy cull as a broken
+     * transform is the trap this diagnostic keeps falling into. */
+    {
+        int onscreen = n && isfinite(s_xf[0].pos[0]) && isfinite(s_xf[0].pos[1])
+            && s_xf[0].pos[0] >= (float)s_gpu.clip_x
+            && s_xf[0].pos[0] <= (float)(s_gpu.clip_x + s_gpu.clip_w)
+            && s_xf[0].pos[1] >= (float)s_gpu.clip_y
+            && s_xf[0].pos[1] <= (float)(s_gpu.clip_y + s_gpu.clip_h);
+        if (onscreen)
+            s_gpu.xf_flat_onscreen++;
+        if (!onscreen)
+            return;                /* culled by the title, not by us */
+    }
+    if (left < 0) {
+        const char *e = getenv("RECOMP_XF_FLAT");
+        left = e ? atoi(e) : 0;
+        e = getenv("RECOMP_XF_FLAT_AT");
+        at = e ? atol(e) : 0;    /* report only from this batch id on */
+    }
+    if (left <= 0)
+        return;
+    if ((long)(s_gpu.batches_program + s_gpu.batches_ffp) < at)
+        return;
+    left--;
+    fprintf(stderr, "[XFFLAT] batch %u prim %u n %u mode 0x%X idx %u %u %u"
+                    " dropped %u (behind %u degen %u clip %u) imm %u inline %u\n",
+            s_gpu.batches_program + s_gpu.batches_ffp,
+            s_gpu.prim, n, s_gpu.xf_mode, s_gpu.idx[0], s_gpu.idx[1],
+            s_gpu.idx[2], s_b_fail, s_b_behind, s_b_degen, s_b_clip,
+            (unsigned)s_gpu.imm_used, s_gpu.inline_active);
+    /* The inputs are the fork in the road: identical raw positions mean the
+     * fetch is reading one vertex for every index (stride, offset), sane
+     * and varied positions mean the program or its constants collapse
+     * them. */
+    for (i = 0; i < NV_VERTEX_ATTRS; i++) {
+        const VertexAttr *at2 = &s_gpu.attr[i];
+        float in[4];
+        if (!at2->size) {
+            fprintf(stderr, "[XFFLAT]   v%u immediate %g %g %g %g\n", i,
+                    s_gpu.imm_attr[i][0], s_gpu.imm_attr[i][1],
+                    s_gpu.imm_attr[i][2], s_gpu.imm_attr[i][3]);
+            continue;
+        }
+        fetch_attr(at2, s_gpu.idx[0], in);
+        fprintf(stderr, "[XFFLAT]   v%u off %08X (raw %08X fmt %08X) type %u"
+                        " size %u stride %u = %g %g %g %g\n", i,
+                at2->offset, at2->raw_off, at2->raw_fmt, at2->type,
+                at2->size, at2->stride, in[0], in[1], in[2], in[3]);
+    }
+    /* The first three indices of the position stream, each with fetch
+     * status and (for index 0) the raw words in guest memory: identical
+     * fetches mean the buffer itself holds one repeated vertex -- the fill
+     * never landed -- while differing fetches with identical outputs would
+     * indict the program. ok=0 is fetch_attr refusing the address. */
+    if (s_gpu.attr[0].size && n >= 3) {
+        const VertexAttr *p0 = &s_gpu.attr[0];
+        float in[4];
+        int ok;
+        uint32_t i;
+        for (i = 0; i < 3; i++) {
+            ok = fetch_attr(p0, s_gpu.idx[i], in);
+            fprintf(stderr, "[XFFLAT]   v0@i%u ok=%d = %g %g %g %g\n",
+                    s_gpu.idx[i], ok, in[0], in[1], in[2], in[3]);
+        }
+        if (!s_gpu.inline_active) {
+            uint32_t addr = dma_resolve(p0->offset + s_gpu.idx[0] * p0->stride);
+            if (guest_span_ok(addr, attr_elem_bytes(p0))) {
+                const uint32_t *raw =
+                    (const uint32_t *)(xbox_GetMemoryOffset() + addr);
+                fprintf(stderr, "[XFFLAT]   v0raw @%08X %08X %08X %08X %08X\n",
+                        addr, raw[0], raw[1], raw[2], raw[3]);
+            }
+        }
+    }
+    {
+        uint32_t show = n < 4 ? n : 4;
+        for (i = 0; i < show; i++)
+            fprintf(stderr, "[XFFLAT]   out%u pos %g %g %g (w %g)\n", i,
+                    s_xf[i].pos[0], s_xf[i].pos[1], s_xf[i].pos[2],
+                    s_xf[i].pos[3]);
+    }
+    /* What the program actually consumed for the first vertex, and what it
+     * is: the fetch above is the buffer, this is the argument. A program
+     * that reads none of the fetched attributes, or that turns them into the
+     * viewport offset (c[59]) because a temp stayed zero, is visible here and
+     * in the disassembly that follows. */
+    {
+        float in[NV2A_VSH_INPUTS][4];
+        Nv2aVshOutput o;
+        uint32_t a, need = nv2a_vsh_input_mask();
+
+        fprintf(stderr, "[XFFLAT]   need %04X\n", need);
+        for (a = 0; a < NV2A_VSH_INPUTS; a++) {
+            memset(in[a], 0, sizeof in[a]);
+            if (!(need & (1u << a)))
+                continue;
+            if (!s_gpu.attr[a].size)
+                memcpy(in[a], s_gpu.imm_attr[a], sizeof in[a]);
+            else
+                fetch_attr(&s_gpu.attr[a], s_gpu.idx[0], in[a]);
+            fprintf(stderr, "[XFFLAT]   in v%u = %g %g %g %g\n", a,
+                    in[a][0], in[a][1], in[a][2], in[a][3]);
+        }
+        if (nv2a_vsh_run((const float (*)[4])in, &o))
+            fprintf(stderr, "[XFFLAT]   prog0 pos %g %g %g %g\n",
+                    o.pos[0], o.pos[1], o.pos[2], o.pos[3]);
+        nv2a_vsh_dump_current();
+    }
+    for (i = 58; i < 60; i++) {
+        const float *c = nv2a_vsh_constant(i);
+        fprintf(stderr, "[XFFLAT]   c[%u] %g %g %g %g\n", i,
+                c[0], c[1], c[2], c[3]);
+    }
+    fprintf(stderr, "[XFFLAT]   clip %ux%u+%u+%u near-z %g\n",
+            s_gpu.clip_w, s_gpu.clip_h, s_gpu.clip_x, s_gpu.clip_y,
+            s_xf_o[2]);
 }
 
 /* ── Parallel vertex transform ───────────────────────────────────────────
@@ -3386,15 +3743,29 @@ static void raster_batch_program(void)
         s_gpu.batches_program++;
         s_gpu.verts_program += n;
     } else {
-        static int ftrace = -1;
+        static int ftrace = -1, fmin = -1;
 
         s_gpu.batches_ffp++;
-        /* RECOMP_FFP_TRACE: the matrix and the first vertices of the first few
+        /* RECOMP_FFP_TRACE=<n>: the matrix and the first vertices of up to n
          * fixed-function batches, raw and transformed -- the one view that
-         * tells a wrong matrix layout from wrong vertex data. */
-        if (ftrace < 0)
-            ftrace = getenv("RECOMP_FFP_TRACE") != NULL;
-        if (ftrace && s_gpu.batches_ffp <= 4) {
+         * tells a wrong matrix layout from wrong vertex data.
+         *
+         * Only batches of at least RECOMP_FFP_TRACE_MIN vertices are reported
+         * (default 256): the first four batches of a run are menu quads, and
+         * what a stage draws its ground and mountains with is fixed-function
+         * batches of hundreds to thousands of vertices. Without the size gate
+         * the report is always spent before the scene starts. */
+        if (ftrace < 0) {
+            const char *t = getenv("RECOMP_FFP_TRACE");
+            const char *mn = getenv("RECOMP_FFP_TRACE_MIN");
+
+            ftrace = t ? atoi(t) : 0;
+            if (t && !*t)
+                ftrace = 4;                     /* set but empty: old meaning */
+            fmin = mn ? atoi(mn) : 256;
+        }
+        if (ftrace > 0 && n >= (uint32_t)(fmin > 0 ? fmin : 0)) {
+            ftrace--;
             const float *m = s_gpu.composite;
             float in[4];
 
@@ -3413,6 +3784,24 @@ static void raster_batch_program(void)
                         s_gpu.idx[i], in[0], in[1], in[2], in[3],
                         s_xf[i].pos[0], s_xf[i].pos[1], s_xf[i].pos[2],
                         s_xf[i].pos[3]);
+            }
+            /* Where the batch lands, as a bounding box over every vertex, not
+             * the first four: a chunk whose first triangle is off-screen and
+             * whose rest is not reads as "nothing drew" from four vertices. */
+            {
+                float nx = 1e30f, xx = -1e30f, ny = 1e30f, xy = -1e30f, zw = 0;
+                for (i = 0; i < n; i++) {
+                    const float *p = s_xf[i].pos;
+                    if (p[0] < nx) nx = p[0];
+                    if (p[0] > xx) xx = p[0];
+                    if (p[1] < ny) ny = p[1];
+                    if (p[1] > xy) xy = p[1];
+                    zw += p[2];
+                }
+                fprintf(stderr, "  [FFP]   x %g..%g y %g..%g  mean z %g"
+                                "  (window %ux%u at %u,%u)\n",
+                        nx, xx, ny, xy, n ? zw / (float)n : 0.0f,
+                        s_gpu.clip_w, s_gpu.clip_h, s_gpu.clip_x, s_gpu.clip_y);
             }
         }
     }
@@ -3475,6 +3864,8 @@ static void raster_batch_program(void)
     if (s_gpu.texs[0].valid)
         note_texture_use();
 
+    s_b_ok = s_b_fail = 0;      /* per-batch drop census (xf_flat_report) */
+    s_b_behind = s_b_degen = s_b_clip = 0;
     switch (s_gpu.prim) {
     case NV_PRIM_TRIANGLES:
         for (i = 0; i + 2 < n; i += 3)
@@ -3508,6 +3899,7 @@ static void raster_batch_program(void)
     xf_queue_flush();
     if (backend_draws())
         backend_flush(!s_xf_no_tex);
+    xf_flat_report(n);
 }
 
 static void raster_batch(void)
@@ -3525,6 +3917,70 @@ static void raster_batch(void)
     if (!batch_is_screen_space()) {
         s_gpu.batches_untransformed++;
         return;
+    }
+    /* RECOMP_BATCH_CLASS=<n>: the path the first n big batches of a run take.
+     * A batch of hundreds of vertices reaching the screen-space path is either
+     * a title drawing pre-transformed geometry or a transform that was never
+     * applied, and which one it is decides whether the world it belongs to is
+     * drawn at all. */
+    {
+        static int left = -1, minv = -1;
+        if (left < 0) {
+            const char *e = getenv("RECOMP_BATCH_CLASS");
+            const char *mn = getenv("RECOMP_BATCH_CLASS_MIN");
+            left = e ? atoi(e) : 0;
+            minv = mn ? atoi(mn) : 256;
+        }
+        if (left > 0 && s_gpu.idx_count >= (uint32_t)(minv > 0 ? minv : 0)) {
+            float p[4];
+            left--;
+            fetch_attr(&s_gpu.attr[0], s_gpu.idx[0], p);
+            fprintf(stderr, "  [CLASS] batch %u prg %u ffp %u: prim %u n %u ->"
+                            " SCREEN (mode 0x%X composite %d inline %d) v0"
+                            " %g %g %g %g clip %ux%u\n",
+                    s_gpu.batches_program + s_gpu.batches_ffp,
+                    s_gpu.batches_program, s_gpu.batches_ffp, s_gpu.prim,
+                    s_gpu.idx_count, s_gpu.xf_mode, s_gpu.composite_set,
+                    s_gpu.inline_active, p[0], p[1], p[2], p[3],
+                    s_gpu.clip_w, s_gpu.clip_h);
+            /* A large batch in fixed-function mode with no composite method:
+             * it needed a transform it did not get, and the transform context
+             * is the vertex constant file, so that file is where the matrix
+             * would have landed. Print it -- CMAT is c[0..3], PMAT c[4..7],
+             * MMAT0 c[8..11], and the viewport scale/offset c[58]/c[59] are
+             * printed beside them to show which of them the title fills. */
+            if ((s_gpu.xf_mode & 3) != 2 && !s_gpu.composite_set) {
+                const float *m = s_gpu.composite;
+                const float *c0 = nv2a_vsh_constant(0);
+                const float *c4 = nv2a_vsh_constant(4);
+                const float *c8 = nv2a_vsh_constant(8);
+                const float *vs = nv2a_vsh_constant(58);
+                const float *vo = nv2a_vsh_constant(59);
+                fprintf(stderr,
+                        "  [CLASS]   method CMAT %g %g %g %g | %g %g %g %g |"
+                        " %g %g %g %g | %g %g %g %g\n"
+                        "  [CLASS]   c[0]  %g %g %g %g | %g %g %g %g |"
+                        " %g %g %g %g | %g %g %g %g\n"
+                        "  [CLASS]   c[4]  %g %g %g %g | %g %g %g %g |"
+                        " %g %g %g %g | %g %g %g %g\n"
+                        "  [CLASS]   c[8]  %g %g %g %g | %g %g %g %g |"
+                        " %g %g %g %g | %g %g %g %g\n"
+                        "  [CLASS]   VPSCL %g %g %g %g  VPOFF %g %g %g %g\n",
+                    m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7],
+                    m[8], m[9], m[10], m[11], m[12], m[13], m[14], m[15],
+                    c0[0], c0[1], c0[2], c0[3], c0[4], c0[5], c0[6], c0[7],
+                    c0[8], c0[9], c0[10], c0[11], c0[12], c0[13], c0[14],
+                    c0[15],
+                    c4[0], c4[1], c4[2], c4[3], c4[4], c4[5], c4[6], c4[7],
+                    c4[8], c4[9], c4[10], c4[11], c4[12], c4[13], c4[14],
+                    c4[15],
+                    c8[0], c8[1], c8[2], c8[3], c8[4], c8[5], c8[6], c8[7],
+                    c8[8], c8[9], c8[10], c8[11], c8[12], c8[13], c8[14],
+                    c8[15],
+                    vs[0], vs[1], vs[2], vs[3],
+                    vo[0], vo[1], vo[2], vo[3]);
+            }
+        }
     }
 
     /* Count why, once per batch: the texture stage cannot change inside one. */
@@ -4249,11 +4705,17 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     if (s_ftrace == 2) {
         /* RECOMP_FRAME_TRACE_METHODS: every method of the traced frame,
          * less the bulk (vertex data, program and constant uploads). */
-        static int all = -1;
-        if (all < 0)
+        static int all = -1, consts = -1;
+        if (all < 0) {
             all = getenv("RECOMP_FRAME_TRACE_METHODS") != NULL;
+            /* The transform program and constant ranges are bulk (32 words a
+             * method) and are skipped by default. RECOMP_FRAME_TRACE_CONSTS
+             * keeps them: the fixed-function transform's matrix is four
+             * constants, and SET_TRANSFORM_CONSTANT_LOAD says which. */
+            consts = getenv("RECOMP_FRAME_TRACE_CONSTS") != NULL;
+        }
         if (all && !(method >= 0x1800 && method < 0x1A00)
-            && !(method >= 0x0B00 && method < 0x0C00))
+            && !(!consts && method >= 0x0B00 && method < 0x0C00))
             fprintf(stderr, "[FTRACE]   m %u:%04X = %08X%c", subch, method,
                     param, 10);
     }
@@ -4712,9 +5174,12 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
              * the window when it names contiguous memory. */
             s_gpu.attr[(method - NV097_SET_VERTEX_DATA_ARRAY_OFFSET) / 4].offset =
                 dma_resolve(param);
+            s_gpu.attr[(method - NV097_SET_VERTEX_DATA_ARRAY_OFFSET) / 4].raw_off =
+                param;
         } else if (method >= NV097_SET_VERTEX_DATA_ARRAY_FORMAT
                 && method < NV097_SET_VERTEX_DATA_ARRAY_FORMAT + NV_VERTEX_ATTRS * 4) {
             VertexAttr *a = &s_gpu.attr[(method - NV097_SET_VERTEX_DATA_ARRAY_FORMAT) / 4];
+            a->raw_fmt = param;
             a->type   =  param        & 0x0F;
             a->size   = (param >> 4)  & 0x0F;
             if (a->size == 7)                   /* SIZE_3W */
@@ -4945,6 +5410,20 @@ void nv2a_pb_exec_report(void)
     fprintf(stderr, "[GPU] vertex programs: %u batches, %u vertices;"
                     " %u triangles dropped behind the eye\n",
             s_gpu.batches_program, s_gpu.verts_program, s_gpu.tris_behind);
+    fprintf(stderr, "[GPU] flat batches: %u of %u lost every triangle"
+                    " (%u all behind-eye, %u all degenerate, %u mixed;"
+                    " %u of them on screen, RECOMP_XF_FLAT reports those)\n",
+            s_gpu.xf_flat_batches,
+            s_gpu.batches_program + s_gpu.batches_ffp,
+            s_gpu.xf_flat_behind, s_gpu.xf_flat_degen, s_gpu.xf_flat_mixed,
+            s_gpu.xf_flat_onscreen);
+    fprintf(stderr, "[GPU] back end: %u triangles on-screen, %u off-screen;"
+                    " submitted x %.0f..%.0f y %.0f..%.0f\n",
+            s_gpu.xf_be_on, s_gpu.xf_be_off,
+            s_gpu.xf_be_seeded ? (double)s_gpu.xf_be_min[0] : 0.0,
+            s_gpu.xf_be_seeded ? (double)s_gpu.xf_be_max[0] : 0.0,
+            s_gpu.xf_be_seeded ? (double)s_gpu.xf_be_min[1] : 0.0,
+            s_gpu.xf_be_seeded ? (double)s_gpu.xf_be_max[1] : 0.0);
     if (s_gpu.batches_ffp)
         fprintf(stderr, "[GPU] fixed-function transform: %u batches\n",
                 s_gpu.batches_ffp);

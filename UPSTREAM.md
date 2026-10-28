@@ -55,6 +55,32 @@ an ordinary clone.
 - `src/input/*`, `src/usb/usb_gamepad.c` — keyboard-to-pad bridge and synthetic
   pad for headless testing.
 
+- `src/nv2a/nv2a_pb_gl.c` — the fragment shader's `rc_stage()` now implements
+  the whole `SET_SHADER_STAGE_PROGRAM` table the CPU rasteriser's
+  `rc_stage_fetch()` works from (none, projected 2D, cubemap, passthrough,
+  clip plane, zero for the bump-env and dot-product modes), and discards for
+  the clip-plane stage. `rc_upload()` no longer refuses a batch over a mode
+  it cannot evaluate: refusing disabled the combiners for that batch and
+  painted it `v0` times a texel, which is black for a lit model. This is what
+  Otogi's player model and bamboo needed.
+- `src/kernel/nv2a_backend.h`, `nv2a_pb_exec.c` — `Nv2aBatch` carries
+  `clip_plane_mode`, filled from the executor's state, so a back end can
+  apply the clip-plane stage's per-channel compare.
+- `src/kernel/nv2a_pb_exec.c` — `sample_tex()` gained `D3DFMT_G8B8` (0x28,
+  two 8-bit channels and no alpha) and `linear_twin()` maps it to
+  `D3DFMT_LIN_G8B8`; without both, a swizzled G8B8 texture fell through to
+  the unsupported-format path and a back end bound white for it.
+- `src/nv2a/nv2a_core.c` — `pvideo_write()` reports the first few
+  `NV_PVIDEO_BUFFER` writes that arm a bank. PVIDEO is only composited where
+  a presenter runs, so a headless capture of a title's movie is black either
+  because the overlay is doing its job off-screen or because the title never
+  programmed it, and nothing else tells those apart.
+- New diagnostics in `nv2a_pb_gl.c`: `RECOMP_GL_NO_COMB` (skip the combiners,
+  modulate stage 0 by the vertex colour) to bisect a scene that paints wrong,
+  and the `[PBGL] stage modes` census, which prints each
+  `SHADER_STAGE_PROGRAM` slot count once per run at frames 300, 3000 and
+  6000.
+
 ## Updating
 
 The submodule tracks our fork, so a rebase is a branch operation in

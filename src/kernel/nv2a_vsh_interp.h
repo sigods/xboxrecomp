@@ -64,4 +64,10 @@ const float *nv2a_vsh_constant(uint32_t index);   /* for traces */
 void nv2a_vsh_constant_component(uint32_t index, uint32_t comp, uint32_t word);
 void nv2a_vsh_set_instruction(uint32_t slot, const uint32_t words[4]);
 
+/* Disassemble the program loaded now, from its start slot, to stderr. The
+ * executor calls this from a batch diagnostic (see RECOMP_XF_FLAT): a batch
+ * whose every vertex lands on one point needs the instructions, not a
+ * count. */
+void nv2a_vsh_dump_current(void);
+
 #endif

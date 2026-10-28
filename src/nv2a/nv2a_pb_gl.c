@@ -28,6 +28,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "nv2a_backend.h"
 #include "nv2a_pb_gl.h"
@@ -57,56 +58,246 @@ static uint32_t      s_zscale_override;
 static uint32_t      s_tex_refresh;   /* frames between re-uploads, 0 = once */
 
 static GLuint s_prog;
-static GLint  u_surf, u_origin, u_incz, u_tex, u_texsize, u_alphatest,
-              u_alphafunc, u_alpharef, u_textured;
+static GLint  u_surf, u_origin, u_incz, u_tex, u_tex1, u_tex2, u_tex3,
+              u_alphatest, u_alphafunc, u_alpharef, u_textured;
+/* The register combiners, as uniforms: uRcCin/uRcAin hold the ICW bytes, the
+ * two output registers and their flag halves, and the factors. The GLSL below
+ * is nv2a_combiner.c's nv2a_rc_eval written for a fragment shader -- the same
+ * arithmetic on the same registers, because "diffuse times stage 0" is a
+ * different function (it paints opaque black where a combiner takes its
+ * colour from the alpha channel, which is every menu's text). */static GLint  u_rc_on, u_rc_stages, u_rc_muxalpha, u_rc_stpar, u_rc_cin,
+              u_rc_ain, u_rc_cout, u_rc_flags, u_rc_c0, u_rc_c1, u_rc_final,
+              u_rc_fc0, u_rc_fc1, u_rc_fog, u_rc_clip, u_flat;
+static GLuint s_white;              /* 1x1 white: an unbound stage's texel */
 
 static const char *k_vs =
     "#version 330 core\n"
-    "layout(location=0) in vec2 aPos;\n"      /* surface pixels */
-    "layout(location=1) in float aZ;\n"       /* the title's depth units */
-    "layout(location=2) in float aRhw;\n"     /* 1/w */
-    "layout(location=3) in uint aColor;\n"    /* 0xAARRGGBB */
-    "layout(location=4) in vec2 aUV;\n"       /* texels */
+    "layout(location=0) in vec4 aPos;\n"      /* x, y, z, 1/w */
+    "layout(location=1) in uvec2 aCol;\n"     /* diffuse, specular */
+    "layout(location=2) in vec4 aSt0;\n"      /* stage 0: s, t, q, - */
+    "layout(location=3) in vec4 aSt1;\n"
+    "layout(location=4) in vec4 aSt2;\n"
+    "layout(location=5) in vec4 aSt3;\n"
+    "layout(location=6) in float aFog;\n"     /* interpolated fog factor */
     "uniform vec2 uSurf;\n"
     "uniform vec2 uOrigin;\n"
     "uniform float uInvZ;\n"
     "out vec4 vColor;\n"
-    "out vec2 vUV;\n"
+    "out vec4 vSpec;\n"
+    "out vec4 vSt0;\n"
+    "out vec4 vSt1;\n"
+    "out vec4 vSt2;\n"
+    "out vec4 vSt3;\n"
+    "out float vFog;\n"
+    "vec4 uncol(uint c) {\n"
+    "    return vec4(float((c >> 16u) & 255u), float((c >> 8u) & 255u),\n"
+    "                float(c & 255u), float((c >> 24u) & 255u)) / 255.0;\n"
+    "}\n"
     "void main() {\n"
-    "    float w = (aRhw != 0.0) ? 1.0 / aRhw : 1.0;\n"
+    "    float w = (aPos.w != 0.0) ? 1.0 / aPos.w : 1.0;\n"
     /* Screen y runs down, GL's runs up: flip it here so the image comes out
      * the right way up, and take the winding flip that costs with it in
      * apply_state(). Everything else is a straight mapping of surface pixels
      * into the viewport. */
     "    vec2 ndc = vec2((aPos.x - uOrigin.x) / uSurf.x * 2.0 - 1.0,\n"
     "                    1.0 - (aPos.y - uOrigin.y) / uSurf.y * 2.0);\n"
-    "    float z = clamp(aZ * uInvZ, 0.0, 1.0);\n"
+    "    float z = clamp(aPos.z * uInvZ, 0.0, 1.0);\n"
     /* Carry the title's own w in gl_Position.w so GL's perspective-correct
      * interpolation weights the varyings the way the CPU rasteriser's
      * 1/w interpolation does. */
     "    gl_Position = vec4(ndc * w, z * w, w);\n"
-    "    vColor = vec4(float((aColor >> 16u) & 255u),\n"
-    "                  float((aColor >>  8u) & 255u),\n"
-    "                  float((aColor      ) & 255u),\n"
-    "                  float((aColor >> 24u) & 255u)) / 255.0;\n"
-    "    vUV = aUV;\n"
+    "    vColor = uncol(aCol.x);\n"
+    "    vSpec  = uncol(aCol.y);\n"
+    "    vSt0 = aSt0; vSt1 = aSt1; vSt2 = aSt2; vSt3 = aSt3;\n"
+    "    vFog = aFog;\n"
     "}\n";
 
+/* The combiner, and the alpha test that reads its result. Register numbers,
+ * input mappings and the final combiner are nv2a_combiner.h's. */
 static const char *k_fs =
     "#version 330 core\n"
     "in vec4 vColor;\n"
-    "in vec2 vUV;\n"
-    "uniform sampler2D uTex;\n"
-    "uniform vec2 uTexSize;\n"
+    "in vec4 vSpec;\n"
+    "in vec4 vSt0;\n"
+    "in vec4 vSt1;\n"
+    "in vec4 vSt2;\n"
+    "in vec4 vSt3;\n"
+    "in float vFog;\n"
+    "uniform sampler2D uTex;\n"        /* stage 0 */
+    "uniform sampler2D uTex1;\n"
+    "uniform sampler2D uTex2;\n"
+    "uniform sampler2D uTex3;\n"
     "uniform int uTextured;\n"
     "uniform int uAlphaTest;\n"
     "uniform int uAlphaFunc;\n"
     "uniform float uAlphaRef;\n"
+    "uniform int uRcOn;\n"
+    "uniform int uRcStages;\n"
+    "uniform int uRcMuxAlpha;\n"
+    "uniform uint uRcStPar;\n"
+    "uniform uvec4 uRcClip[8];\n"
+    "uniform uvec4 uRcCin[8];\n"
+    "uniform uvec4 uRcAin[8];\n"
+    "uniform uvec2 uRcCout[8];\n"
+    "uniform uvec2 uRcFlags[8];\n"
+    "uniform vec4 uRcC0[8];\n"
+    "uniform vec4 uRcC1[8];\n"
+    "uniform uvec2 uRcFinal;\n"
+    "uniform vec4 uRcFC0;\n"
+    "uniform vec4 uRcFC1;\n"
+    "uniform vec4 uRcFog;\n"
+    "uniform int uFlat;\n"
     "out vec4 frag;\n"
+    /* PS_INPUTMAPPING (nv2a_combiner.c map_in). */
+    "float rc_in(float x, uint byte) {\n"
+    "    float p = max(x, 0.0);\n"
+    "    switch ((byte >> 5) & 7u) {\n"
+    "    case 0u: return p;\n"
+    "    case 1u: return 1.0 - clamp(x, 0.0, 1.0);\n"
+    "    case 2u: return 2.0 * p - 1.0;\n"
+    "    case 3u: return -2.0 * p + 1.0;\n"
+    "    case 4u: return p - 0.5;\n"
+    "    case 5u: return -p + 0.5;\n"
+    "    case 6u: return x;\n"
+    "    default: return -x;\n"
+    "    }\n"
+    "}\n"
+    "float rc_out(float x, uint m) {\n"
+    "    if (m == 0x08u) return x - 0.5;\n"
+    "    if (m == 0x10u) return x * 2.0;\n"
+    "    if (m == 0x18u) return (x - 0.5) * 2.0;\n"
+    "    if (m == 0x20u) return x * 4.0;\n"
+    "    if (m == 0x30u) return x * 0.5;\n"
+    "    return x;\n"
+    "}\n"
+    "vec3 rc_rgb(vec4 R[16], uint byte) {\n"
+    "    vec4 r = R[byte & 0xFu];\n"
+    "    vec3 s = ((byte & 0x10u) != 0u) ? r.aaa : r.rgb;\n"
+    "    return vec3(rc_in(s.x, byte), rc_in(s.y, byte), rc_in(s.z, byte));\n"
+    "}\n"
+    "float rc_a(vec4 R[16], uint byte) {\n"
+    "    vec4 r = R[byte & 0xFu];\n"
+    "    return rc_in(((byte & 0x10u) != 0u) ? r.a : r.b, byte);\n"
+    "}\n"
+    /* One stage result, by its SHADER_STAGE_PROGRAM mode, and the same table
+     * the CPU rasteriser's rc_stage_fetch() works from (nv2a_pb_exec.c):
+     * 0 none, 1/2 a projected 2D sample, 3 a cubemap, 4 the coordinate
+     * itself, 5 a clip plane, everything else the bump-env and dot-product
+     * modes, which read zero until something depends on one.
+     *
+     * The clip-plane stage does not shade: it kills the pixel, which is why
+     * this can discard from inside a function. A batch using one of these
+     * modes used to be refused outright -- uRcOn stayed 0 and the whole
+     * batch fell back to "diffuse times stage 0" -- and the title's player
+     * model and bamboo are exactly such batches: they came out black, and
+     * RECOMP_GL_FLAT showed every one of their triangles arriving and passing
+     * every raster gate. Matching the CPU table here is what paints them. */
+    "vec4 rc_stage(uint st, uint mode, vec4 c, sampler2D tx) {\n"
+    "    if (mode == 0u) return vec4(0.0, 0.0, 0.0, 1.0);\n"
+    "    if (mode == 4u) return clamp(c, 0.0, 1.0);\n"
+    "    if (mode == 5u) {\n"
+    "        for (int j = 0; j < 4; j++) {\n"
+    "            bool ge = uRcClip[st][j] != 0u;\n"
+    "            if (ge ? c[j] >= 0.0 : c[j] < 0.0) discard;\n"
+    "        }\n"
+    "        return vec4(0.0);\n"
+    "    }\n"
+    "    if (mode >= 6u) return vec4(0.0);\n"
+    "    float q = (c.w != 0.0) ? c.w : 1.0;\n"
+    "    return texture(tx, c.xy / q);\n"
+    "}\n"
+    "vec4 rc_eval(vec4 t0, vec4 t1, vec4 t2, vec4 t3) {\n"
+    "    vec4 R[16];\n"
+    "    for (int i = 0; i < 16; i++) R[i] = vec4(0.0);\n"
+    "    R[3] = vec4(uRcFog.rgb, vFog);\n"
+    "    R[4] = vColor;\n"
+    "    R[5] = vSpec;\n"
+    "    R[8] = t0; R[9] = t1; R[10] = t2; R[11] = t3;\n"
+    "    R[12] = vec4(0.0, 0.0, 0.0, ((uRcStPar & 0x1Fu) != 0u) ? t0.a : 1.0);\n"
+    "    for (int s = 0; s < uRcStages; s++) {\n"
+    "        uint fl = uRcFlags[s].x, afl = uRcFlags[s].y;\n"
+    "        vec3 A, B, C, D, ab, cd, ms;\n"
+    "        float aA, aB, aC, aD, aab, acd, ams;\n"
+    "        bool mux = uRcMuxAlpha != 0 ? (R[0].a >= 0.5)\n"
+    "                                   : ((int(R[0].a * 255.0) & 1) != 0);\n"
+    "        R[1] = uRcC0[s];\n"
+    "        R[2] = uRcC1[s];\n"
+    "        A = rc_rgb(R, uRcCin[s].x); B = rc_rgb(R, uRcCin[s].y);\n"
+    "        C = rc_rgb(R, uRcCin[s].z); D = rc_rgb(R, uRcCin[s].w);\n"
+    "        aA = rc_a(R, uRcAin[s].x); aB = rc_a(R, uRcAin[s].y);\n"
+    "        aC = rc_a(R, uRcAin[s].z); aD = rc_a(R, uRcAin[s].w);\n"
+    "        for (int i = 0; i < 3; i++) {\n"
+    "            float dab = dot(A, B), dcd = dot(C, D);\n"
+    "            float pab = ((fl & 2u) != 0u) ? dab : A[i] * B[i];\n"
+    "            float pcd = ((fl & 1u) != 0u) ? dcd : C[i] * D[i];\n"
+    "            float sum = ((fl & 4u) != 0u) ? (mux ? pcd : pab) : pab + pcd;\n"
+    "            ab[i] = clamp(rc_out(pab, fl & 0x38u), -1.0, 1.0);\n"
+    "            cd[i] = clamp(rc_out(pcd, fl & 0x38u), -1.0, 1.0);\n"
+    "            ms[i] = clamp(rc_out(sum, fl & 0x38u), -1.0, 1.0);\n"
+    "        }\n"
+    "        {\n"
+    "            float pab = aA * aB, pcd = aC * aD;\n"
+    "            float sum = ((afl & 4u) != 0u) ? (mux ? pcd : pab) : pab + pcd;\n"
+    "            aab = clamp(rc_out(pab, afl & 0x38u), -1.0, 1.0);\n"
+    "            acd = clamp(rc_out(pcd, afl & 0x38u), -1.0, 1.0);\n"
+    "            ams = clamp(rc_out(sum, afl & 0x38u), -1.0, 1.0);\n"
+    "        }\n"
+    "        {\n"
+    "            uint d = (uRcCout[s].x >> 4) & 0xFu;\n"
+    "            if (d != 0u)\n"
+    "                R[d] = vec4(ab, ((fl & 0x80u) != 0u) ? ab.z : R[d].a);\n"
+    "            d = uRcCout[s].x & 0xFu;\n"
+    "            if (d != 0u)\n"
+    "                R[d] = vec4(cd, ((fl & 0x40u) != 0u) ? cd.z : R[d].a);\n"
+    "            d = (uRcCout[s].x >> 8) & 0xFu;\n"
+    "            if (d != 0u)\n"
+    "                R[d] = vec4(ms, R[d].a);\n"
+    "            d = (uRcCout[s].y >> 4) & 0xFu;\n"
+    "            if (d != 0u) R[d].a = aab;\n"
+    "            d = uRcCout[s].y & 0xFu;\n"
+    "            if (d != 0u) R[d].a = acd;\n"
+    "            d = (uRcCout[s].y >> 8) & 0xFu;\n"
+    "            if (d != 0u) R[d].a = ams;\n"
+    "        }\n"
+    "        R[0] = vec4(0.0);\n"
+    "    }\n"
+    "    vec4 out4;\n"
+    "    if (uRcFinal.x != 0u || uRcFinal.y != 0u) {\n"
+    "        uint f1 = uRcFinal.y, fflags = f1 & 0xFFu;\n"
+    "        R[1] = uRcFC0;\n"
+    "        R[2] = uRcFC1;\n"
+    "        for (int i = 0; i < 3; i++) {\n"
+    "            float a = ((fflags & 0x40u) != 0u) ? 1.0 - R[5][i] : R[5][i];\n"
+    "            float b = ((fflags & 0x20u) != 0u) ? 1.0 - R[12][i] : R[12][i];\n"
+    "            R[14][i] = ((fflags & 0x80u) != 0u) ? clamp(a + b, 0.0, 1.0)\n"
+    "                                               : a + b;\n"
+    "        }\n"
+    "        R[14].a = 0.0;\n"
+    "        R[15] = vec4(rc_rgb(R, f1 >> 24) * rc_rgb(R, f1 >> 16), 0.0);\n"
+    "        vec3 A = rc_rgb(R, uRcFinal.x >> 24);\n"
+    "        vec3 B = rc_rgb(R, uRcFinal.x >> 16);\n"
+    "        vec3 C = rc_rgb(R, uRcFinal.x >> 8);\n"
+    "        vec3 D = rc_rgb(R, uRcFinal.x);\n"
+    "        out4 = vec4(D + C * (1.0 - A) + B * A, rc_a(R, f1 >> 8));\n"
+    "    } else {\n"
+    "        out4 = R[12];\n"
+    "    }\n"
+    "    return clamp(out4, 0.0, 1.0);\n"
+    "}\n"
     "void main() {\n"
-    "    vec4 c = vColor;\n"
-    "    if (uTextured == 1)\n"
-    "        c *= texture(uTex, vUV / uTexSize);\n"
+    "    if (uFlat == 1) { frag = vec4(1.0, 0.0, 1.0, 1.0); return; }\n"
+    "    vec4 c;\n"
+    "    if (uRcOn == 1) {\n"
+    "        vec4 t0 = rc_stage(0u, (uRcStPar >> 0) & 0x1Fu, vSt0, uTex);\n"
+    "        vec4 t1 = rc_stage(1u, (uRcStPar >> 5) & 0x1Fu, vSt1, uTex1);\n"
+    "        vec4 t2 = rc_stage(2u, (uRcStPar >> 10) & 0x1Fu, vSt2, uTex2);\n"
+    "        vec4 t3 = rc_stage(3u, (uRcStPar >> 15) & 0x1Fu, vSt3, uTex3);\n"
+    "        c = rc_eval(t0, t1, t2, t3);\n"
+    "    } else {\n"
+    "        c = vColor;\n"
+    "        if (uTextured == 1)\n"
+    "            c *= texture(uTex, vSt0.xy);\n"
+    "    }\n"
     "    if (uAlphaTest == 1) {\n"
     "        float a = c.a;\n"
     "        int f = uAlphaFunc;\n"
@@ -165,20 +356,41 @@ static int program_build(void)
     u_origin    = glGetUniformLocation(s_prog, "uOrigin");
     u_incz      = glGetUniformLocation(s_prog, "uInvZ");
     u_tex       = glGetUniformLocation(s_prog, "uTex");
-    u_texsize   = glGetUniformLocation(s_prog, "uTexSize");
+    u_tex1      = glGetUniformLocation(s_prog, "uTex1");
+    u_tex2      = glGetUniformLocation(s_prog, "uTex2");
+    u_tex3      = glGetUniformLocation(s_prog, "uTex3");
     u_alphatest = glGetUniformLocation(s_prog, "uAlphaTest");
     u_alphafunc = glGetUniformLocation(s_prog, "uAlphaFunc");
     u_alpharef  = glGetUniformLocation(s_prog, "uAlphaRef");
     u_textured  = glGetUniformLocation(s_prog, "uTextured");
+    u_rc_on      = glGetUniformLocation(s_prog, "uRcOn");
+    u_rc_stages  = glGetUniformLocation(s_prog, "uRcStages");
+    u_rc_muxalpha = glGetUniformLocation(s_prog, "uRcMuxAlpha");
+    u_rc_stpar   = glGetUniformLocation(s_prog, "uRcStPar");
+    u_rc_cin     = glGetUniformLocation(s_prog, "uRcCin");
+    u_rc_ain     = glGetUniformLocation(s_prog, "uRcAin");
+    u_rc_cout    = glGetUniformLocation(s_prog, "uRcCout");
+    u_rc_flags   = glGetUniformLocation(s_prog, "uRcFlags");
+    u_rc_c0      = glGetUniformLocation(s_prog, "uRcC0");
+    u_rc_c1      = glGetUniformLocation(s_prog, "uRcC1");
+    u_rc_final   = glGetUniformLocation(s_prog, "uRcFinal");
+    u_rc_fc0     = glGetUniformLocation(s_prog, "uRcFC0");
+    u_rc_fc1     = glGetUniformLocation(s_prog, "uRcFC1");
+    u_rc_clip    = glGetUniformLocation(s_prog, "uRcClip");
+    u_rc_fog     = glGetUniformLocation(s_prog, "uRcFog");
+    u_flat       = glGetUniformLocation(s_prog, "uFlat");
     return 1;
 }
 
-/* The vertex the executor hands over, in the layout the vertex shader reads. */
+/* The vertex the executor hands over, in the layout the vertex shader reads:
+ * position and 1/w, the two colours, every stage's texture coordinate (s, t,
+ * q -- the combiners read all four stages), and the fog factor. */
 typedef struct {
     float    x, y, z, rhw;
-    uint32_t color;
-    float    u, v;
-    uint32_t pad;
+    uint32_t color, specular;
+    float    st[4][4];
+    float    fogf;
+    float    pad[3];
 } GlVert;
 
 static GLuint s_vao, s_vbo;
@@ -417,68 +629,227 @@ static int tex_upload(GlTex *e, const Nv2aTexture *t)
     return 1;
 }
 
-/* Bind stage 0, uploading the texture the first time it is seen. */
-static void texture_bind(const Nv2aTexture *t, uint32_t frame)
+/* Address mode and filter, as the CPU sampler applies them: the NV2A's 1 is
+ * wrap, 2 mirror, everything else clamps; MAG 2 is tent, MIN 2/4/6 is tent at
+ * level 0, everything else nearest. */
+static void tex_params(const Nv2aTexture *t)
+{
+    GLint u = GL_REPEAT, v = GL_REPEAT;
+    uint32_t mag = (t->filter >> 24) & 0xF, min = (t->filter >> 16) & 0xFF;
+    GLint f;
+
+    if (t->addr_u == 2) u = GL_MIRRORED_REPEAT;
+    else if (t->addr_u != 1) u = GL_CLAMP_TO_EDGE;
+    if (t->addr_v == 2) v = GL_MIRRORED_REPEAT;
+    else if (t->addr_v != 1) v = GL_CLAMP_TO_EDGE;
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, u);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, v);
+    f = (mag == 2 || min == 2 || min == 4 || min == 6) ? GL_LINEAR : GL_NEAREST;
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, f);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, f);
+}
+
+/* Which stages a draw has a texture bound on: the combiner shader samples
+ * them, and a stage with none reads as the CPU sampler's failure colour (white)
+ * rather than an unbound GL texture. */
+static int s_stage_ok[4];
+
+/* Bind one texture stage, uploading the texture the first time it is seen.
+ * Returns 0 when there is nothing to bind (or the format cannot be decoded),
+ * which the caller reports to the shader as "stage off". */
+static int stage_bind(uint32_t unit, const Nv2aTexture *t, uint32_t frame)
 {
     GlTex *e = t ? tex_find(t) : NULL;
 
-    glActiveTexture(GL_TEXTURE0);
+    glActiveTexture(GL_TEXTURE0 + unit);
     if (!t) {
         glBindTexture(GL_TEXTURE_2D, 0);
-        glUniform1i(u_textured, 0);
-        glUniform2f(u_texsize, 1.0f, 1.0f);
-        return;
+        return 0;
     }
     if (!e) {
         e = tex_slot();
         if (!tex_upload(e, t)) {
+            static uint32_t complained;
             glBindTexture(GL_TEXTURE_2D, 0);
-            glUniform1i(u_textured, 0);
-            glUniform2f(u_texsize, 1.0f, 1.0f);
-            return;
+            if (complained++ < 4)
+                fprintf(stderr, "[PBGL] texture %08X %ux%u fmt %02X will not "
+                                "decode; drawn untextured\n", t->offset,
+                        t->width, t->height, t->color);
+            return 0;
         }
     } else if (s_tex_refresh && frame && (frame % s_tex_refresh) == 0) {
         tex_upload(e, t);
     }
     glBindTexture(GL_TEXTURE_2D, e->tex);
+    tex_params(t);
+    return 1;
+}
 
-    /* Address mode: the NV2A's 1 is wrap, 2 mirror, everything else clamps,
-     * which is what the CPU sampler's wrap_coord() does. */
-    {
-        GLint u = GL_REPEAT, v = GL_REPEAT;
-        if (t->addr_u == 2) u = GL_MIRRORED_REPEAT;
-        else if (t->addr_u != 1) u = GL_CLAMP_TO_EDGE;
-        if (t->addr_v == 2) v = GL_MIRRORED_REPEAT;
-        else if (t->addr_v != 1) v = GL_CLAMP_TO_EDGE;
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, u);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, v);
-    }
-    /* Level 0 only, as the CPU sampler does: MAG 2 is tent, MIN 2/4/6 is tent
-     * at level 0, everything else nearest. */
-    {
-        uint32_t mag = (t->filter >> 24) & 0xF, min = (t->filter >> 16) & 0xFF;
-        GLint f = (mag == 2 || min == 2 || min == 4 || min == 6)
-                  ? GL_LINEAR : GL_NEAREST;
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, f);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, f);
+/* Bind stage 0 and tell the shader about it (the fallback pixel path). */
+static void texture_bind(const Nv2aTexture *t, uint32_t frame)
+{
+    if (!stage_bind(0, t, frame)) {
+        glUniform1i(u_textured, 0);
+        return;
     }
     glUniform1i(u_textured, 1);
     glUniform1i(u_tex, 0);
-    glUniform2f(u_texsize, (float)t->width, (float)t->height);
 }
 
 /* ── State ──────────────────────────────────────────────────────────────── */
+
+/* Does this shader evaluate the stage's mode? Every mode the CPU rasteriser
+ * implements is now handled by rc_stage(), which follows nv2a_pb_exec.c's
+ * rc_stage_fetch() table; there is nothing left to refuse, so the combiner
+ * runs for every batch that has one. */
+/* Which stage modes the title uses, counted across every batch of a run and
+ * printed once, so "a mode this shader samples as 2D" can be told from "a mode
+ * that reads zero" rather than guessed from one wrong-looking model. */
+static uint32_t s_mode_hist[32];
+
+/* Per-batch combiner state -> uniforms. nv2a_rc_eval's inputs, decoded the
+ * same way the CPU rasteriser decodes them: the ICW bytes go up as they are
+ * (the shader's rc_in/rc_rgb apply the mapping), the output registers packed
+ * three nibbles at a time, and the factors resolved per stage here so the
+ * shader needs no decision about COMBINERCOUNT. */
+static int rc_upload(const Nv2aBatch *b, const Nv2aVertex *v)
+{
+    const Nv2aCombiner *rc = b->combiner;
+    uint32_t cin[8][4], ain[8][4], cout[8][2], flags[8][2];
+    float c0[8][4], c1[8][4], f0[4], f1[4];
+    int on = 0, i;
+    uint32_t n, ctl, per_stage_c0, per_stage_c1;
+
+    (void)v;
+    /* The CPU rasteriser evaluates the combiner whenever the title has
+     * programmed one (rc_seen), and falls back to modulate only otherwise.
+     * Matching that exactly is the point: a batch whose combiner reads (0,0,0,1)
+     * for an off stage is a different draw from "diffuse times texture". */
+    if (!rc)
+        goto off;
+    for (i = 0; i < 4; i++)
+        s_mode_hist[(rc->stage_program >> (i * 5)) & 0x1F]++;
+    /* Every stage mode runs the combiner. Refusing the batch to the fallback
+     * (the old "mode not implemented" exit) cost the title its player model
+     * and its bamboo: those batches use modes this shader samples as a plain
+     * 2D lookup, and disabling the combiner painted them v0 times a texel,
+     * which is black. rc_stage() now implements the same table as the CPU
+     * rasteriser's rc_stage_fetch(), so the modes that read zero and the one
+     * that kills the pixel do so here too. */
+    ctl = rc->control;
+    n = ctl & 0xFF;
+    if (n > 8)
+        n = 8;
+    per_stage_c0 = (ctl >> 8) & 0x10;    /* COMBINERCOUNT bit for c0 */
+    per_stage_c1 = (ctl >> 8) & 0x100;   /* ... and for c1 */
+    for (i = 0; i < 8; i++) {
+        uint32_t s = (uint32_t)i;
+        nv2a_rc_unpack(rc->factor0[per_stage_c0 ? s : 0], c0[i]);
+        nv2a_rc_unpack(rc->factor1[per_stage_c1 ? s : 0], c1[i]);
+        cin[i][0] = (rc->color_icw[i] >> 24) & 0xFF;
+        cin[i][1] = (rc->color_icw[i] >> 16) & 0xFF;
+        cin[i][2] = (rc->color_icw[i] >> 8) & 0xFF;
+        cin[i][3] = rc->color_icw[i] & 0xFF;
+        ain[i][0] = (rc->alpha_icw[i] >> 24) & 0xFF;
+        ain[i][1] = (rc->alpha_icw[i] >> 16) & 0xFF;
+        ain[i][2] = (rc->alpha_icw[i] >> 8) & 0xFF;
+        ain[i][3] = rc->alpha_icw[i] & 0xFF;
+        cout[i][0] = rc->color_ocw[i];
+        cout[i][1] = rc->alpha_ocw[i];
+        flags[i][0] = rc->color_ocw[i] >> 12;
+        flags[i][1] = rc->alpha_ocw[i] >> 12;
+    }
+    nv2a_rc_unpack(rc->final_c0, f0);
+    nv2a_rc_unpack(rc->final_c1, f1);
+    {
+        /* SET_CLIP_PLANE_MODE: one bit per stage per coordinate channel. */
+        uint32_t clip[8][4];
+        int j;
+        for (i = 0; i < 8; i++)
+            for (j = 0; j < 4; j++)
+                clip[i][j] = (b->clip_plane_mode >> (i * 4 + j)) & 1u;
+        glUniform4uiv(u_rc_clip, 8, (const GLuint *)clip);
+    }
+    on = 1;
+
+    glUniform1i(u_rc_stages, (int)n);
+    glUniform1i(u_rc_muxalpha, (int)((ctl >> 8) & 1));
+    glUniform1ui(u_rc_stpar, rc->stage_program);
+    glUniform4uiv(u_rc_cin, 8, (const GLuint *)cin);
+    glUniform4uiv(u_rc_ain, 8, (const GLuint *)ain);
+    glUniform2uiv(u_rc_cout, 8, (const GLuint *)cout);
+    glUniform2uiv(u_rc_flags, 8, (const GLuint *)flags);
+    glUniform4fv(u_rc_c0, 8, (const GLfloat *)c0);
+    glUniform4fv(u_rc_c1, 8, (const GLfloat *)c1);
+    glUniform2ui(u_rc_final, rc->final0, rc->final1);
+    glUniform4fv(u_rc_fc0, 1, f0);
+    glUniform4fv(u_rc_fc1, 1, f1);
+    {
+        /* FOG_COLOR is R in bits 0-7, the reverse of a D3DCOLOR. */
+        float fogc[4];
+        nv2a_rc_unpack(b->fog_color, fogc);
+        { float r = fogc[2]; fogc[2] = fogc[0]; fogc[0] = r; }
+        glUniform4fv(u_rc_fog, 1, fogc);
+    }
+    /* RECOMP_GL_NO_COMB: skip the register combiners and modulate stage 0 by
+     * the vertex colour, which is the back end's original pixel stage. A
+     * scene that paints black with the combiner on and lit without it has a
+     * combiner problem; one that is black either way has a colour or texture
+     * problem. */
+    glUniform1i(u_rc_on, getenv("RECOMP_GL_NO_COMB") != NULL ? 0 : on);
+    /* Stage 0's texture is also the one the fallback path samples. */
+    glUniform1i(u_textured, b->textures[0] && s_stage_ok[0] ? 1 : 0);
+    return on;
+
+  off:
+    /* No combiner (or one whose stage modes this shader does not evaluate):
+     * the batch's pixel stage is the old modulate, which is what the CPU
+     * rasteriser does for the same batch. The texture has to stay bound for
+     * it -- leaving uTextured at apply_state's 0 drew every such batch in flat
+     * vertex colour, and a stage-0 texture with it. */
+    glUniform1i(u_rc_on, 0);
+    glUniform1i(u_textured, b->textures[0] && s_stage_ok[0] ? 1 : 0);
+    return 0;
+}
+
+/* Diagnostic overrides, all off unless the environment asks for them: each
+ * one forces a raster state open so a scene that draws too little can be
+ * bisected (is it the cull, the depth test, the alpha test?). They are how
+ * the 2026-10-27 stage capture was narrowed down and are kept for the next
+ * title whose world comes out half drawn. */
+static int s_no_cull, s_no_depth, s_no_blend, s_no_alpha, s_allchan;
+
+static void state_env_init(void)
+{
+    static time_t last;
+    time_t now = time(NULL);
+
+    if (now == last)
+        return;
+    last = now;
+    s_no_cull  = getenv("RECOMP_GL_NO_CULL")  != NULL;
+    s_no_depth = getenv("RECOMP_GL_NO_DEPTH") != NULL;
+    s_no_blend = getenv("RECOMP_GL_NO_BLEND") != NULL;
+    s_no_alpha = getenv("RECOMP_GL_NO_ALPHA") != NULL;
+    s_allchan  = getenv("RECOMP_GL_ALLCHAN")  != NULL;
+    /* RECOMP_GL_FLAT: paint every surviving fragment one colour. Depth, cull
+     * and alpha test still apply, so what is magenta is geometry that is
+     * drawn and passes every gate -- the answer to "is the missing thing not
+     * submitted, or not painted". */
+    glUniform1i(u_flat, getenv("RECOMP_GL_FLAT") != NULL ? 1 : 0);
+}
 
 static void apply_state(const Nv2aRenderState *rs, const Nv2aSurface *s,
                         uint32_t frame)
 {
     static const uint32_t none = 0;
 
+    state_env_init();
     glUniform2f(u_surf, (float)s->width, (float)s->height);
     glUniform2f(u_origin, (float)s->x, (float)s->y);
     glUniform1f(u_incz, 1.0f / (float)z_divisor(rs));
 
-    if (rs->blend_enable) {
+    if (rs->blend_enable && !s_no_blend) {
         glEnable(GL_BLEND);
         glBlendFunc(rs->blend_src, rs->blend_dst);   /* NV2A carries GL's
                                                       * own factor enums */
@@ -494,21 +865,30 @@ static void apply_state(const Nv2aRenderState *rs, const Nv2aSurface *s,
         glDisable(GL_BLEND);
     }
 
-    if (rs->depth_test_enable) glEnable(GL_DEPTH_TEST);
-    else glDisable(GL_DEPTH_TEST);
-    glDepthFunc(rs->depth_func ? rs->depth_func : 0x207);
-    glDepthMask(rs->depth_write ? GL_TRUE : GL_FALSE);
+    if (s_no_depth) {
+        glEnable(GL_DEPTH_TEST);
+        glDepthFunc(GL_ALWAYS);
+        glDepthMask(GL_TRUE);
+    } else {
+        if (rs->depth_test_enable) glEnable(GL_DEPTH_TEST);
+        else glDisable(GL_DEPTH_TEST);
+        glDepthFunc(rs->depth_func ? rs->depth_func : 0x207);
+        glDepthMask(rs->depth_write ? GL_TRUE : GL_FALSE);
+    }
 
-    glUniform1i(u_alphatest, rs->alpha_test_enable ? 1 : 0);
+    glUniform1i(u_alphatest,
+                (rs->alpha_test_enable && !s_no_alpha) ? 1 : 0);
     glUniform1i(u_alphafunc, (int)rs->alpha_func);
     glUniform1f(u_alpharef, (float)(rs->alpha_ref & 0xFF) / 255.0f);
 
-    {
+    if (s_allchan) {
+        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    } else {
         uint32_t m = rs->color_mask;
         glColorMask((m >> 16) & 1, (m >> 8) & 1, m & 1, (m >> 24) & 1);
     }
 
-    if (rs->cull_enable) {
+    if (rs->cull_enable && !s_no_cull) {
         glEnable(GL_CULL_FACE);
         glCullFace(rs->cull_face ? rs->cull_face : 0x0405);
         /* Our y axis is the NV2A's flipped (see the vertex shader), so the
@@ -566,6 +946,24 @@ static void gl_clear(const Nv2aSurface *s, const Nv2aRenderState *rs,
     if (flags & 0x01) {                      /* depth */
         double z = (zf == 1 ? (double)(zstencil & 0xFFFF)
                             : (double)(zstencil >> 8)) / (double)z_divisor(rs);
+        /* Print on change: the depth clear's VALUE decides what every later
+         * comparison can pass against, and "wrong units" lives right here. */
+        {
+            static int seen = -1;
+            int key = (int)(z * 1e6) ^ (flags << 8) ^ (zf << 4)
+                    ^ (rs->zeta_format << 1);
+            if (seen < 0) {
+                const char *e = getenv("RECOMP_GL_STATE");
+                seen = e && *e ? 1 : 0;
+            }
+            if (seen && key != seen) {
+                seen = key ? key : 1;
+                fprintf(stderr, "[GLST] clear flags %X zstencil %08X -> z %f"
+                        " (zf %u div %u) argb %08X zfmt %X\n",
+                        flags, zstencil, z, zf, z_divisor(rs), argb,
+                        rs->zeta_format);
+            }
+        }
         glClearDepth(z < 0.0 ? 0.0 : (z > 1.0 ? 1.0 : z));
         bits |= GL_DEPTH_BUFFER_BIT;
     }
@@ -592,6 +990,89 @@ static int vert_usable(const Nv2aVertex *v)
         && isfinite(v->rhw) && fabsf(v->x) < 1e6f && fabsf(v->y) < 1e6f;
 }
 
+/* RECOMP_GL_COMB=<n>: the pixel stage the title asked for, once per distinct
+ * configuration, for the 2D batches (z = 0, rhw = 1) a back end gets wrong
+ * most visibly -- a menu's text. "Diffuse times stage 0" is not the combiner:
+ * where a title takes the colour from the alpha channel it paints opaque
+ * black instead. What this prints is the register set the CPU rasteriser
+ * evaluates (nv2a_combiner.h), which is the one to match. */
+static void comb_report(const Nv2aBatch *b, const Nv2aVertex *v)
+{
+    static int left = -1;
+    static uint32_t seen[64];
+    static int nseen;
+    const Nv2aCombiner *rc = b->combiner;
+    uint32_t h, i;
+    int s, dup = 0;
+
+    if (left < 0) {
+        const char *e = getenv("RECOMP_GL_COMB");
+        left = e ? atoi(e) : 0;
+    }
+    if (left <= 0 || !rc || !b->count)
+        return;
+    if (v->z != 0.0f || v->rhw != 1.0f)
+        return;                                  /* 3D: not the text case */
+    h = 2166136261u;
+    for (i = 0; i < 8; i++)
+        h = (h ^ rc->color_icw[i]) * 16777619u;
+    for (i = 0; i < 8; i++)
+        h = (h ^ (rc->alpha_icw[i] * 3 + rc->color_ocw[i])) * 16777619u;
+    h = (h ^ rc->stage_program) * 16777619u;
+    h = (h ^ rc->control) * 16777619u;
+    h = (h ^ rc->final0) * 16777619u;
+    h = (h ^ rc->final1) * 16777619u;
+    h = (h ^ rc->factor0[0]) * 16777619u;
+    h = (h ^ rc->factor1[0]) * 16777619u;
+    for (i = 0; i < (uint32_t)nseen; i++)
+        if (seen[i] == h) dup = 1;
+    if (dup)
+        return;
+    if (nseen < (int)(sizeof seen / sizeof seen[0]))
+        seen[nseen++] = h;
+    left--;
+    fprintf(stderr, "[GLCOMB] batch n %u col %08X spec %08X uv %g %g"
+                    " stpar %08X ctl %08X final %08X/%08X f0 %08X f1 %08X"
+                    " fog %08X\n",
+            b->count, v->diffuse, v->specular, v->u, v->v, rc->stage_program,
+            rc->control, rc->final0, rc->final1, rc->final_c0, rc->final_c1,
+            b->fog_color);
+    for (s = 0; s < 8; s++)
+        fprintf(stderr, "[GLCOMB]   stage %d c %08X/%08X a %08X/%08X"
+                        " fac %08X %08X\n", s, rc->color_icw[s],
+                rc->color_ocw[s], rc->alpha_icw[s], rc->alpha_ocw[s],
+                rc->factor0[s], rc->factor1[s]);
+    for (i = 0; i < 4; i++) {
+        const Nv2aTexture *tex = b->textures[i];
+        fprintf(stderr, "[GLCOMB]   tex%u %s", i,
+                tex ? "" : "(none)\n");
+        if (tex)
+            fprintf(stderr, " off %08X %ux%u fmt %02X pitch %u\n",
+                    tex->offset, tex->width, tex->height, tex->color,
+                    tex->pitch);
+    }
+}
+
+static void gl_vert_fill(GlVert *o, const Nv2aVertex *v)
+{
+    int st, j;
+
+    o->x = v->x; o->y = v->y; o->z = v->z; o->rhw = v->rhw;
+    o->color = v->diffuse;
+    o->specular = v->specular;
+    o->fogf = v->fogf;
+    /* Normalised coordinates, one vec4 per stage: s, t, q and the sampler's
+     * spare. The combiners' stage fetch divides by q exactly as the CPU
+     * rasteriser does (nv2a_pb_exec.c's rc_stage_fetch), which is why nothing
+     * here scales by the texture size -- the sampler's own normalisation is
+     * the same thing, and it keeps a passthrough stage's coordinates
+     * comparable instead of multiplied by a size that only this stage's
+     * texture has. */
+    for (st = 0; st < 4; st++)
+        for (j = 0; j < 4; j++)
+            o->st[st][j] = v->st[st][j];
+}
+
 static void gl_draw(const Nv2aSurface *s, const Nv2aBatch *b)
 {
     GlTarget *t;
@@ -607,6 +1088,7 @@ static void gl_draw(const Nv2aSurface *s, const Nv2aBatch *b)
         return;
     target_bind(t, s);
     apply_state(b->state, s, s_frame);
+    comb_report(b, &b->vertices[0]);
 
     need = b->count;
     if (need > s_verts_cap) {
@@ -626,13 +1108,10 @@ static void gl_draw(const Nv2aSurface *s, const Nv2aBatch *b)
             dropped++;
             continue;
         }
-        o[0].x = v0->x; o[0].y = v0->y; o[0].z = v0->z; o[0].rhw = v0->rhw;
-        o[0].color = v0->diffuse; o[0].u = v0->u; o[0].v = v0->v;
-        o[1].x = v1->x; o[1].y = v1->y; o[1].z = v1->z; o[1].rhw = v1->rhw;
-        o[1].color = v1->diffuse; o[1].u = v1->u; o[1].v = v1->v;
-        o[2].x = v2->x; o[2].y = v2->y; o[2].z = v2->z; o[2].rhw = v2->rhw;
-        o[2].color = v2->diffuse; o[2].u = v2->u; o[2].v = v2->v;
-        o[0].pad = o[1].pad = o[2].pad = 0;
+        gl_vert_fill(&o[0], v0);
+        gl_vert_fill(&o[1], v1);
+        gl_vert_fill(&o[2], v2);
+        o[0].pad[0] = o[1].pad[0] = o[2].pad[0] = 0.0f;
         out += 3;
     }
     if (dropped) {
@@ -649,7 +1128,22 @@ static void gl_draw(const Nv2aSurface *s, const Nv2aBatch *b)
     glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(out * sizeof(GlVert)),
                  s_verts, GL_STREAM_DRAW);
 
-    texture_bind(b->texture, s_frame);
+    /* Every stage the title programmed, then the pixel stage itself. A stage
+     * with nothing to bind gets a white texel, which is what the CPU
+     * rasteriser's sampler returns when it cannot read one. */
+    for (i = 0; i < 4; i++) {
+        s_stage_ok[i] = stage_bind(i, b->textures[i], s_frame);
+        if (!s_stage_ok[i]) {
+            glActiveTexture(GL_TEXTURE0 + i);
+            glBindTexture(GL_TEXTURE_2D, s_white);
+        }
+    }
+    glActiveTexture(GL_TEXTURE0);
+    glUniform1i(u_tex, 0);
+    glUniform1i(u_tex1, 1);
+    glUniform1i(u_tex2, 2);
+    glUniform1i(u_tex3, 3);
+    rc_upload(b, &b->vertices[0]);
 
     glDrawArrays(GL_TRIANGLES, 0, (GLsizei)out);
     s_frame_dirty = 1;
@@ -726,6 +1220,19 @@ static void gl_flip(void)
 {
     if (!s_ready || !gl_ready())
         return;
+    if (s_frame == 300 || s_frame == 3000 || s_frame == 6000) {
+        int k, any = 0;
+        fprintf(stderr, "[PBGL] stage modes at frame %u (stage uses): ",
+                (unsigned)s_frame);
+        for (k = 0; k < 32; k++)
+            if (s_mode_hist[k]) {
+                fprintf(stderr, "%u x%u ", k, s_mode_hist[k]);
+                any = 1;
+            }
+        if (!any)
+            fprintf(stderr, "none");
+        fprintf(stderr, "\n");
+    }
     if (s_frame_dirty && s_cur) {
         readback();
         s_frame_dirty = 0;
@@ -800,20 +1307,40 @@ int nv2a_pb_gl_init(void)
     glGenBuffers(1, &s_vbo);
     glBindBuffer(GL_ARRAY_BUFFER, s_vbo);
     glEnableVertexAttribArray(0);
-    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, sizeof(GlVert),
+    glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, sizeof(GlVert),
                           (const void *)0);
     glEnableVertexAttribArray(1);
-    glVertexAttribPointer(1, 1, GL_FLOAT, GL_FALSE, sizeof(GlVert),
-                          (const void *)8);
-    glEnableVertexAttribArray(2);
-    glVertexAttribPointer(2, 1, GL_FLOAT, GL_FALSE, sizeof(GlVert),
-                          (const void *)12);
-    glEnableVertexAttribArray(3);
-    glVertexAttribIPointer(3, 1, GL_UNSIGNED_INT, sizeof(GlVert),
+    glVertexAttribIPointer(1, 2, GL_UNSIGNED_INT, sizeof(GlVert),
                            (const void *)16);
+    glEnableVertexAttribArray(2);
+    glVertexAttribPointer(2, 4, GL_FLOAT, GL_FALSE, sizeof(GlVert),
+                          (const void *)24);
+    glEnableVertexAttribArray(3);
+    glVertexAttribPointer(3, 4, GL_FLOAT, GL_FALSE, sizeof(GlVert),
+                          (const void *)40);
     glEnableVertexAttribArray(4);
-    glVertexAttribPointer(4, 2, GL_FLOAT, GL_FALSE, sizeof(GlVert),
-                          (const void *)20);
+    glVertexAttribPointer(4, 4, GL_FLOAT, GL_FALSE, sizeof(GlVert),
+                          (const void *)56);
+    glEnableVertexAttribArray(5);
+    glVertexAttribPointer(5, 4, GL_FLOAT, GL_FALSE, sizeof(GlVert),
+                          (const void *)72);
+    glEnableVertexAttribArray(6);
+    glVertexAttribPointer(6, 1, GL_FLOAT, GL_FALSE, sizeof(GlVert),
+                          (const void *)88);
+
+    /* A texture unit nothing is bound to samples as black, and the CPU
+     * rasteriser's failed sample is white (rc_texel); a stage the title
+     * programmed but this back end has no texture for reads the same on both
+     * sides only if the unit holds white. */
+    {
+        static const uint8_t white[4] = { 255, 255, 255, 255 };
+        glGenTextures(1, &s_white);
+        glBindTexture(GL_TEXTURE_2D, s_white);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 1, 1, 0, GL_RGBA,
+                     GL_UNSIGNED_BYTE, white);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    }
 
     glDisable(GL_DITHER);
     glEnable(GL_MULTISAMPLE);

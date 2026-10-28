@@ -312,6 +312,14 @@ static int vsh_compile(void)
     return 0;                             /* ran off memory: no FINAL */
 }
 
+/* RECOMP_VSH_DUMP's disassembly of whatever program is loaded now, callable
+ * from the executor's batch diagnostics: a batch that collapses needs the
+ * instructions that did it, not a count. */
+void nv2a_vsh_dump_current(void)
+{
+    dump_program(s_start_slot);
+}
+
 /* Rebuild the decoded form if program memory or the start slot changed. */
 static int vsh_ensure_code(void)
 {
