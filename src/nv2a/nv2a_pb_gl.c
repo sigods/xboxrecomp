@@ -1015,21 +1015,32 @@ static int vert_usable(const Nv2aVertex *v)
  * evaluates (nv2a_combiner.h), which is the one to match. */
 static void comb_report(const Nv2aBatch *b, const Nv2aVertex *v)
 {
-    static int left = -1;
-    static uint32_t seen[64];
+    static int left = -1, left3 = -1, min3 = -1;
+    static uint32_t seen[256];
     static int nseen;
     const Nv2aCombiner *rc = b->combiner;
     uint32_t h, i;
-    int s, dup = 0;
+    int s, dup = 0, two_d;
 
     if (left < 0) {
         const char *e = getenv("RECOMP_GL_COMB");
+        const char *e3 = getenv("RECOMP_GL_COMB3");
+        const char *m3 = getenv("RECOMP_GL_COMB3_MIN");
         left = e ? atoi(e) : 0;
+        left3 = e3 ? atoi(e3) : 0;
+        /* The world's geometry is the big 3D batches; a dump that fills up on
+         * sprites never reaches them. */
+        min3 = m3 ? atoi(m3) : 300;
     }
-    if (left <= 0 || !rc || !b->count)
+    if ((!left && !left3) || !rc || !b->count)
         return;
-    if (v->z != 0.0f || v->rhw != 1.0f)
-        return;                                  /* 3D: not the text case */
+    /* RECOMP_GL_COMB3 is the same record for 3D batches, where the question
+     * is the fog: the first vertex's factor is what the fragment shader's
+     * fog register holds, and a stage that is supposed to be textured but is
+     * painted flat is either that factor or the final combiner's A input. */
+    two_d = v->z == 0.0f && v->rhw == 1.0f;
+    if (two_d ? left <= 0 : (left3 <= 0 || b->count < (uint32_t)min3))
+        return;
     h = 2166136261u;
     for (i = 0; i < 8; i++)
         h = (h ^ rc->color_icw[i]) * 16777619u;
@@ -1041,19 +1052,23 @@ static void comb_report(const Nv2aBatch *b, const Nv2aVertex *v)
     h = (h ^ rc->final1) * 16777619u;
     h = (h ^ rc->factor0[0]) * 16777619u;
     h = (h ^ rc->factor1[0]) * 16777619u;
+    h = (h ^ (two_d ? 1u : 2u)) * 16777619u;   /* the two are reported apart */
     for (i = 0; i < (uint32_t)nseen; i++)
         if (seen[i] == h) dup = 1;
     if (dup)
         return;
     if (nseen < (int)(sizeof seen / sizeof seen[0]))
         seen[nseen++] = h;
-    left--;
+    if (two_d)
+        left--;
+    else
+        left3--;
     fprintf(stderr, "[GLCOMB] batch n %u col %08X spec %08X uv %g %g"
-                    " stpar %08X ctl %08X final %08X/%08X f0 %08X f1 %08X"
-                    " fog %08X\n",
-            b->count, v->diffuse, v->specular, v->u, v->v, rc->stage_program,
-            rc->control, rc->final0, rc->final1, rc->final_c0, rc->final_c1,
-            b->fog_color);
+                    " fogf %g stpar %08X ctl %08X final %08X/%08X"
+                    " f0 %08X f1 %08X fog %08X\n",
+            b->count, v->diffuse, v->specular, v->u, v->v, v->fogf,
+            rc->stage_program, rc->control, rc->final0, rc->final1,
+            rc->final_c0, rc->final_c1, b->fog_color);
     for (s = 0; s < 8; s++)
         fprintf(stderr, "[GLCOMB]   stage %d c %08X/%08X a %08X/%08X"
                         " fac %08X %08X\n", s, rc->color_icw[s],
