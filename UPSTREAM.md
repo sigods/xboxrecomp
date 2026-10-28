@@ -80,6 +80,14 @@ an ordinary clone.
   and the `[PBGL] stage modes` census, which prints each
   `SHADER_STAGE_PROGRAM` slot count once per run at frames 300, 3000 and
   6000.
+- `src/nv2a/nv2a_pb_gl.c`, `apply_state()` — `glFrontFace()` now uses the
+  title's `SET_FRONT_FACE` value unchanged. It was mirrored on the theory
+  that the vertex shader's y flip had to be paid back, but the flip is what
+  makes window-space winding match the NV2A's screen-space one, so mirroring
+  kept the back faces of every closed mesh: Otogi's bamboo drew as hollow
+  black wedges and the player as an inside-out silhouette. Found by
+  `RECOMP_GL_NO_CULL=1` restoring both on the same capture
+  (`docs/BOOT_LOG.md`, 2026-10-28).
 
 ## Updating
 

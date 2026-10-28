@@ -218,8 +218,8 @@ static const char *k_fs =
     "        uint fl = uRcFlags[s].x, afl = uRcFlags[s].y;\n"
     "        vec3 A, B, C, D, ab, cd, ms;\n"
     "        float aA, aB, aC, aD, aab, acd, ams;\n"
-    "        bool mux = uRcMuxAlpha != 0 ? (R[0].a >= 0.5)\n"
-    "                                   : ((int(R[0].a * 255.0) & 1) != 0);\n"
+    "        bool mux = uRcMuxAlpha != 0 ? (R[12].a >= 0.5)\n"
+        "                                   : ((int(R[12].a * 255.0) & 1) != 0);\n"
     "        R[1] = uRcC0[s];\n"
     "        R[2] = uRcC1[s];\n"
     "        A = rc_rgb(R, uRcCin[s].x); B = rc_rgb(R, uRcCin[s].y);\n"
@@ -891,11 +891,18 @@ static void apply_state(const Nv2aRenderState *rs, const Nv2aSurface *s,
     if (rs->cull_enable && !s_no_cull) {
         glEnable(GL_CULL_FACE);
         glCullFace(rs->cull_face ? rs->cull_face : 0x0405);
-        /* Our y axis is the NV2A's flipped (see the vertex shader), so the
-         * winding that reads "front" to us is the one it calls back. Swap the
-         * two and the same triangles survive as under the NV2A's own
-         * projected-position facing rule. */
-        glFrontFace(rs->front_face == 0x0900 ? 0x0901 : 0x0900);
+        /* SET_FRONT_FACE names the winding the title calls front, and the
+         * rasteriser has to keep that set. It used to be written mirrored on
+         * the theory that the vertex shader's y flip (which does invert the
+         * winding) had to be paid back here; that is the wrong end of the
+         * pipeline -- the flip makes window-space winding match the NV2A's
+         * screen-space one, so the name carries over unchanged. Mirrored, the
+         * stage drew the inside of every closed mesh: the bamboo trunks were
+         * hollow black wedges, the player was his own back faces, and the
+         * ground (a single up-facing sheet) was culled away completely. That
+         * was exactly what the 2026-10-28 capture with RECOMP_GL_NO_CULL=1
+         * proved: culling off restored the trunks and the ground. */
+        glFrontFace(rs->front_face == 0x0900 ? 0x0900 : 0x0901);
     } else {
         glDisable(GL_CULL_FACE);
     }
