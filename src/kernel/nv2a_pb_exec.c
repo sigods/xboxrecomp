@@ -2234,6 +2234,29 @@ static void backend_flush(int textured)
     /* The combiners, unless the title never sent one (then the pixel stage is
      * the back end's own modulate, exactly as the CPU path falls back).
      * s_gpu.rc is the same state the CPU rasteriser evaluates. */
+    /* RECOMP_CULL_LOG=<n>: the first n batches of the run that turn culling
+     * on, with the flip they were drawn in. Whether a title culls at all is
+     * the difference between "the front-face register is wrong" and "culling
+     * never happens here", and the state sample above is drawn from the first
+     * batches of a frame -- the sky -- which never cull. */
+    {
+        static int left = -1;
+        if (left < 0) {
+            const char *e = getenv("RECOMP_CULL_LOG");
+            left = e ? atoi(e) : 0;
+        }
+        if (left > 0 && rs.cull_enable) {
+            left--;
+            fprintf(stderr, "[CULL] batch %u flip %u prim %u n %u face %X"
+                            " front %X | v0 %g %g z %g rhw %g\n",
+                    s_gpu.batches_program, s_gpu.flips, s_gpu.prim, s_bcount,
+                    rs.cull_face, rs.front_face,
+                    s_bcount ? s_bverts[0].x : 0.0f,
+                    s_bcount ? s_bverts[0].y : 0.0f,
+                    s_bcount ? s_bverts[0].z : 0.0f,
+                    s_bcount ? s_bverts[0].rhw : 0.0f);
+        }
+    }
     batch.combiner = s_gpu.rc_seen ? &s_gpu.rc : NULL;
     batch.fog_color = s_gpu.fog_color;
     batch.clip_plane_mode = s_gpu.clip_plane_mode;
@@ -2538,6 +2561,15 @@ static int rc_stage_fetch(int st, const float c[4], float out[4])
 static float fog_factor(float d)
 {
     float f, px = s_gpu.fog_param[0], py = s_gpu.fog_param[1];
+    /* RECOMP_FOG_ONE: hand every pixel the "no fog" factor whatever the fog
+     * unit says. A scene painted entirely in the fog colour is either a fog
+     * unit that never stops fogging or a combiner that reads the register
+     * the other way round, and forcing the factor separates those two. */
+    static int one = -1;
+    if (one < 0)
+        one = getenv("RECOMP_FOG_ONE") != NULL;
+    if (one)
+        return 1.0f;
     if (!s_gpu.fog_enable)
         return 1.0f;
     switch (s_gpu.fog_mode) {
@@ -3872,8 +3904,18 @@ static void raster_batch_program(void)
             raster_xf_clipped(&s_xf[i], &s_xf[i+1], &s_xf[i+2]);
         break;
     case NV_PRIM_TRIANGLE_STRIP:
-        for (i = 0; i + 2 < n; i++)
-            raster_xf_clipped(&s_xf[i], &s_xf[i+1], &s_xf[i+2]);
+        /* Every other triangle is reversed so that the whole strip faces the
+         * same way: v0v1v2, v2v1v3, v2v3v4, ... Three consecutive vertices in
+         * ascending order make every odd triangle face the other way, which
+         * costs nothing while nothing culls and tears a culled mesh into
+         * shards -- the alternation is exactly the triangle-sized holes a
+         * character's strip mesh showed in a close-up. */
+        for (i = 0; i + 2 < n; i++) {
+            if (i & 1)
+                raster_xf_clipped(&s_xf[i+1], &s_xf[i], &s_xf[i+2]);
+            else
+                raster_xf_clipped(&s_xf[i], &s_xf[i+1], &s_xf[i+2]);
+        }
         break;
     case NV_PRIM_TRIANGLE_FAN:
     case NV_PRIM_POLYGON:
@@ -4005,9 +4047,15 @@ static void raster_batch(void)
                            vertex_color(s_gpu.idx[i]));
         break;
     case NV_PRIM_TRIANGLE_STRIP:
-        for (i = 0; i + 2 < s_gpu.idx_count; i++)
-            raster_indexed(s_gpu.idx[i], s_gpu.idx[i+1], s_gpu.idx[i+2],
-                           vertex_color(s_gpu.idx[i]));
+        /* Reversed on every other triangle, as in the program path. */
+        for (i = 0; i + 2 < s_gpu.idx_count; i++) {
+            if (i & 1)
+                raster_indexed(s_gpu.idx[i+1], s_gpu.idx[i], s_gpu.idx[i+2],
+                               vertex_color(s_gpu.idx[i+1]));
+            else
+                raster_indexed(s_gpu.idx[i], s_gpu.idx[i+1], s_gpu.idx[i+2],
+                               vertex_color(s_gpu.idx[i]));
+        }
         break;
     case NV_PRIM_TRIANGLE_FAN:
     case NV_PRIM_POLYGON:

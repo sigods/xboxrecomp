@@ -818,6 +818,7 @@ static int rc_upload(const Nv2aBatch *b, const Nv2aVertex *v)
  * the 2026-10-27 stage capture was narrowed down and are kept for the next
  * title whose world comes out half drawn. */
 static int s_no_cull, s_no_depth, s_no_blend, s_no_alpha, s_allchan;
+static int s_front_mirror;
 
 static void state_env_init(void)
 {
@@ -832,6 +833,14 @@ static void state_env_init(void)
     s_no_blend = getenv("RECOMP_GL_NO_BLEND") != NULL;
     s_no_alpha = getenv("RECOMP_GL_NO_ALPHA") != NULL;
     s_allchan  = getenv("RECOMP_GL_ALLCHAN")  != NULL;
+    /* RECOMP_GL_FRONT_MIRROR: the opposite front-face convention. The title's
+     * SET_FRONT_FACE is carried through unchanged because window-space
+     * winding is a picture property: the vertex shader's y flip puts a vertex
+     * on the same pixel the NV2A puts it on, so the name means the same thing
+     * on both. This exists to prove that on a capture -- a title whose culled
+     * geometry comes out inside-out under one convention and right under the
+     * other says which. */
+    s_front_mirror = getenv("RECOMP_GL_FRONT_MIRROR") != NULL;
     /* RECOMP_GL_FLAT: paint every surviving fragment one colour. Depth, cull
      * and alpha test still apply, so what is magenta is geometry that is
      * drawn and passes every gate -- the answer to "is the missing thing not
@@ -902,7 +911,8 @@ static void apply_state(const Nv2aRenderState *rs, const Nv2aSurface *s,
          * ground (a single up-facing sheet) was culled away completely. That
          * was exactly what the 2026-10-28 capture with RECOMP_GL_NO_CULL=1
          * proved: culling off restored the trunks and the ground. */
-        glFrontFace(rs->front_face == 0x0900 ? 0x0900 : 0x0901);
+        glFrontFace(((rs->front_face == 0x0900) != s_front_mirror)
+                    ? 0x0900 : 0x0901);
     } else {
         glDisable(GL_CULL_FACE);
     }
