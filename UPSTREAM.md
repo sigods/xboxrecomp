@@ -58,8 +58,8 @@ an ordinary clone.
 - `src/nv2a/nv2a_pb_gl.c` — the fragment shader's `rc_stage()` now implements
   the whole `SET_SHADER_STAGE_PROGRAM` table the CPU rasteriser's
   `rc_stage_fetch()` works from (none, projected 2D, cubemap, passthrough,
-  clip plane, zero for the bump-env and dot-product modes), and discards for
-  the clip-plane stage. `rc_upload()` no longer refuses a batch over a mode
+  clip plane, bump env, bump env luminance), and discards for the clip-plane
+  stage. `rc_upload()` no longer refuses a batch over a mode
   it cannot evaluate: refusing disabled the combiners for that batch and
   painted it `v0` times a texel, which is black for a lit model. This is what
   Otogi's player model and bamboo needed.
@@ -119,6 +119,19 @@ an ordinary clone.
   offset a later bind reads at a different stride (Otogi binds its 640x480
   `A8R8G8B8` surfaces with pitch 2560). `tex_upload()` stores it alongside
   offset/size/format/levels.
+
+- `BUMPENVMAP` (6) and `BUMPENVMAP_LUMINANCE` (7) — `rc_stage_fetch()` in
+  `src/kernel/nv2a_pb_exec.c` and `rc_stage()` in the GL shader, following
+  xemu's `psh.c`: the previous stage's texel is a normal map, `sign3()` of its
+  blue and green axes goes through the stage's 2x2 bump matrix and displaces
+  this stage's coordinates before the sample; the luminance variant scales it
+  by `scale * lum + offset`. `SET_TEXTURE_SET_BUMP_ENV_MAT` (0x1B28..0x1B34),
+  `_SCALE` (0x1B38) and `_OFFSET` (0x1B3C) are recorded per stage in
+  `Nv2aCombiner` (`bump[4][4]`, `bump_so[4][2]`, `bump_valid`) with an identity
+  matrix where unprogrammed. Until this, a title that programmed stage 1 for
+  the water/heat-haze effect got `(0,0,0,0)` from that stage and painted a hard
+  rectangle where the artwork should continue: Otogi's title screen, over
+  PRESS START (`docs/BOOT_LOG.md`, 2026-10-28).
 
 ## Updating
 

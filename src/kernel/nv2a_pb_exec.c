@@ -2545,9 +2545,27 @@ static void rc_texel(const Texture *t, uint32_t face, float u, float v,
         out[0] = out[1] = out[2] = out[3] = 1.0f;
 }
 
+/* xemu psh.c's sign3(): an unsigned texel channel read as a signed value.
+ * 255 steps, split at 128, which is what the hardware's bump-env stage does
+ * to the bump map it was handed. */
+static float sign3(float x)
+{
+    float v = x * 255.0f;
+    return v >= 128.0f ? (v - 256.0f) / 127.0f : v / 127.0f;
+}
+
+/* sign3 remapped into [0,1] for the luminance of BUMPENVMAP_LUMINANCE. */
+static float sign3_to_0_to_1(float x)
+{
+    return x >= 0.0f ? x * 0.5f : 1.0f + x * 0.5f;
+}
+
 /* What texture stage `st` contributes, by its SHADER_STAGE_PROGRAM mode
- * (xemu psh.c). Returns 0 when a clip-plane stage kills the pixel. */
-static int rc_stage_fetch(int st, const float c[4], float out[4])
+ * (xemu psh.c). `prev` is the stage results so far, which the bump-env modes
+ * read: stage 1 perturbs its coordinates by stage 0's texel, and so on.
+ * Returns 0 when a clip-plane stage kills the pixel. */
+static int rc_stage_fetch(int st, const float c[4],
+                          const float prev[4][4], float out[4])
 {
     const Texture *t = &s_gpu.texs[st];
     uint32_t mode = (s_gpu.rc.stage_program >> (st * 5)) & 0x1F, j;
@@ -2593,9 +2611,53 @@ static int rc_stage_fetch(int st, const float c[4], float out[4])
                 return 0;
         }
         return 1;
+    case 6: {                                     /* BUMPENVMAP */
+        /* The previous stage's texel is a normal map: its blue and green are
+         * read as signed du/dv, run through the stage's 2x2 bump matrix, and
+         * added to this stage's coordinates in normalised units -- which is
+         * what `rc_texel()` takes for a linear texture and rescales for a
+         * swizzled one, so no size is applied here. Otogi's title screen
+         * programs this on stage 1 over a screen-sized texture: it is the
+         * water/heat-haze warp, and returning zero for it (what this case
+         * replaces) removed the effect entirely. */
+        const Nv2aCombiner *rc = &s_gpu.rc;
+        const float *in = st ? prev[st - 1] : (const float[4]){ 0, 0, 0, 1 };
+        float ds = sign3(in[2]), dt = sign3(in[1]), du, dv;
+
+        if (rc->bump_valid & (1u << st)) {
+            du = rc->bump_mat[st][0] * ds + rc->bump_mat[st][1] * dt;
+            dv = rc->bump_mat[st][2] * ds + rc->bump_mat[st][3] * dt;
+        } else {
+            du = ds;                              /* identity matrix */
+            dv = dt;
+        }
+        rc_texel(t, 0, c[0] / q + du, c[1] / q + dv, out);
+        return 1;
+    }
+    case 7: {                                     /* BUMPENVMAP_LUMINANCE */
+        const Nv2aCombiner *rc = &s_gpu.rc;
+        const float *in = st ? prev[st - 1] : (const float[4]){ 0, 0, 0, 1 };
+        float ds = sign3(in[2]), dt = sign3(in[1]);
+        float lum = sign3_to_0_to_1(sign3(in[0]));
+        float du, dv, scale = 1.0f, off = 0.0f;
+
+        if (rc->bump_valid & (1u << st)) {
+            du = rc->bump_mat[st][0] * ds + rc->bump_mat[st][1] * dt;
+            dv = rc->bump_mat[st][2] * ds + rc->bump_mat[st][3] * dt;
+            scale = rc->bump_scale[st];
+            off = rc->bump_offset[st];
+        } else {
+            du = ds;
+            dv = dt;
+        }
+        rc_texel(t, 0, c[0] / q + du, c[1] / q + dv, out);
+        for (j = 0; j < 4; j++)
+            out[j] *= scale * lum + off;
+        return 1;
+    }
     default:
-        /* ponytail: bump-env and dot-product modes read zero; they are water
-         * and bump effects -- add them when a title's look depends on one. */
+        /* ponytail: the dot-product modes read zero; they are specular and
+         * reflection effects -- add them when a title's look depends on one. */
         out[0] = out[1] = out[2] = out[3] = 0.0f;
         return 1;
     }
@@ -2788,7 +2850,8 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
                             for (j = 0; j < 4; j++)
                                 tc[j] = (l0 * T->stc[0][st][j] + l1 * T->stc[1][st][j]
                                        + l2 * T->stc[2][st][j]) / pw;
-                            keep = rc_stage_fetch(st, tc, t[st]);
+                            keep = rc_stage_fetch(st, tc,
+                                                  (const float (*)[4])t, t[st]);
                         }
                         if (!keep)
                             continue;
@@ -4663,6 +4726,27 @@ static int imm_vertex_method(uint32_t method, uint32_t param)
  * 0x1B00 + 0x40*i onwards; only stage 0 used to be decoded, which was
  * enough for menus drawn one texture at a time and not for a 3D frame that
  * composites its scene through a second stage. */
+static float bits_to_float(uint32_t u)
+{
+    union { uint32_t u; float f; } v;
+    v.u = u;
+    return v.f;
+}
+
+/* RECOMP_BUMP_LOG=<n>: the first n bump-env register writes, as floats. The
+ * method addresses are inferred from the register map (0x1B28 matrix, 0x1B38
+ * scale, 0x1B3C offset); a title whose values look wrong here settles the
+ * order without another guess. */
+static int bump_log_left(void)
+{
+    static int left = -1;
+    if (left < 0) {
+        const char *e = getenv("RECOMP_BUMP_LOG");
+        left = e ? atoi(e) : 0;
+    }
+    return left > 0 ? left-- : 0;
+}
+
 static void tex_stage_method(uint32_t method, uint32_t param)
 {
     uint32_t stage = (method - NV_TEX_FIRST) / 0x40;
@@ -4710,6 +4794,24 @@ static void tex_stage_method(uint32_t method, uint32_t param)
         break;
     case 0x1B24:                                  /* SET_TEXTURE_BORDER_COLOR */
         t->border = param;
+        break;
+    case 0x1B28: case 0x1B2C: case 0x1B30: case 0x1B34:
+        /* SET_TEXTURE_SET_BUMP_ENV_MAT: the 2x2 matrix as four float words,
+         * m00, m01, m10, m11 in GPU registers -- the only layout that fits
+         * between 0x1B28 and the scale at 0x1B38. */
+        s_gpu.rc.bump_mat[stage][(reg - 0x1B28) / 4] = bits_to_float(param);
+        s_gpu.rc.bump_valid |= 1u << (stage & 3);
+        if (bump_log_left() > 0)
+            fprintf(stderr, "[BUMP] stage %u mat[%u] %g (%08X)\n", stage,
+                    (reg - 0x1B28) / 4, bits_to_float(param), param);
+        break;
+    case 0x1B38:                                  /* SET_BUMP_ENV_SCALE */
+        s_gpu.rc.bump_scale[stage] = bits_to_float(param);
+        s_gpu.rc.bump_valid |= 1u << (stage & 3);
+        break;
+    case 0x1B3C:                                  /* SET_BUMP_ENV_OFFSET */
+        s_gpu.rc.bump_offset[stage] = bits_to_float(param);
+        s_gpu.rc.bump_valid |= 1u << (stage & 3);
         break;
     default:
         break;

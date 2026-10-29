@@ -67,7 +67,8 @@ static GLint  u_surf, u_origin, u_incz, u_tex, u_tex1, u_tex2, u_tex3,
  * different function (it paints opaque black where a combiner takes its
  * colour from the alpha channel, which is every menu's text). */static GLint  u_rc_on, u_rc_stages, u_rc_muxalpha, u_rc_stpar, u_rc_cin,
               u_rc_ain, u_rc_cout, u_rc_flags, u_rc_c0, u_rc_c1, u_rc_final,
-              u_rc_fc0, u_rc_fc1, u_rc_fog, u_rc_clip, u_flat;
+              u_rc_fc0, u_rc_fc1, u_rc_fog, u_rc_clip, u_flat,
+              u_rc_bump, u_rc_bump_so;
 static GLuint s_white;              /* 1x1 white: an unbound stage's texel */
 
 static const char *k_vs =
@@ -136,6 +137,8 @@ static const char *k_fs =
     "uniform int uRcMuxAlpha;\n"
     "uniform uint uRcStPar;\n"
     "uniform uvec4 uRcClip[8];\n"
+    "uniform vec4 uRcBump[4];\n"       /* per stage: m00, m01, m10, m11 */
+    "uniform vec2 uRcBumpSO[4];\n"     /* per stage: scale, offset */
     "uniform uvec4 uRcCin[8];\n"
     "uniform uvec4 uRcAin[8];\n"
     "uniform uvec2 uRcCout[8];\n"
@@ -192,7 +195,17 @@ static const char *k_fs =
      * model and bamboo are exactly such batches: they came out black, and
      * RECOMP_GL_FLAT showed every one of their triangles arriving and passing
      * every raster gate. Matching the CPU table here is what paints them. */
-    "vec4 rc_stage(uint st, uint mode, vec4 c, sampler2D tx) {\n"
+    /* xemu psh.c's sign3(): an unsigned channel read as a signed bump value. */
+    "float sign3(float x) {\n"
+    "    float v = x * 255.0;\n"
+    "    return v >= 128.0 ? (v - 256.0) / 127.0 : v / 127.0;\n"
+    "}\n"
+    "vec2 rc_bump_dir(uint st, vec4 cin) {\n"
+    "    vec2 d = vec2(sign3(cin.b), sign3(cin.g));\n"
+    "    vec4 m = uRcBump[st];\n"
+    "    return mat2(m.x, m.z, m.y, m.w) * d;\n"
+    "}\n"
+    "vec4 rc_stage(uint st, uint mode, vec4 c, sampler2D tx, vec4 cin) {\n"
     "    if (mode == 0u) return vec4(0.0, 0.0, 0.0, 1.0);\n"
     "    if (mode == 4u) return clamp(c, 0.0, 1.0);\n"
     "    if (mode == 5u) {\n"
@@ -202,7 +215,17 @@ static const char *k_fs =
     "        }\n"
     "        return vec4(0.0);\n"
     "    }\n"
-    "    if (mode >= 6u) return vec4(0.0);\n"
+    "    if (mode == 6u) {\n"            /* BUMPENVMAP */
+    "        float q = (c.w != 0.0) ? c.w : 1.0;\n"
+    "        return texture(tx, c.xy / q + rc_bump_dir(st, cin));\n"
+    "    }\n"
+    "    if (mode == 7u) {\n"            /* BUMPENVMAP_LUMINANCE */
+    "        float q = (c.w != 0.0) ? c.w : 1.0;\n"
+    "        float lum = sign3(cin.r) * 0.5 + 0.5;\n"
+    "        vec4 t = texture(tx, c.xy / q + rc_bump_dir(st, cin));\n"
+    "        return t * (uRcBumpSO[st].x * lum + uRcBumpSO[st].y);\n"
+    "    }\n"
+    "    if (mode >= 8u) return vec4(0.0);\n"
     "    float q = (c.w != 0.0) ? c.w : 1.0;\n"
     "    return texture(tx, c.xy / q);\n"
     "}\n"
@@ -288,10 +311,11 @@ static const char *k_fs =
     "    if (uFlat == 1) { frag = vec4(1.0, 0.0, 1.0, 1.0); return; }\n"
     "    vec4 c;\n"
     "    if (uRcOn == 1) {\n"
-    "        vec4 t0 = rc_stage(0u, (uRcStPar >> 0) & 0x1Fu, vSt0, uTex);\n"
-    "        vec4 t1 = rc_stage(1u, (uRcStPar >> 5) & 0x1Fu, vSt1, uTex1);\n"
-    "        vec4 t2 = rc_stage(2u, (uRcStPar >> 10) & 0x1Fu, vSt2, uTex2);\n"
-    "        vec4 t3 = rc_stage(3u, (uRcStPar >> 15) & 0x1Fu, vSt3, uTex3);\n"
+    "        vec4 t0 = rc_stage(0u, (uRcStPar >> 0) & 0x1Fu, vSt0, uTex,\n"
+    "                          vec4(0.0));\n"
+    "        vec4 t1 = rc_stage(1u, (uRcStPar >> 5) & 0x1Fu, vSt1, uTex1, t0);\n"
+    "        vec4 t2 = rc_stage(2u, (uRcStPar >> 10) & 0x1Fu, vSt2, uTex2, t1);\n"
+    "        vec4 t3 = rc_stage(3u, (uRcStPar >> 15) & 0x1Fu, vSt3, uTex3, t2);\n"
     "        c = rc_eval(t0, t1, t2, t3);\n"
     "    } else {\n"
     "        c = vColor;\n"
@@ -367,6 +391,8 @@ static int program_build(void)
     u_rc_stages  = glGetUniformLocation(s_prog, "uRcStages");
     u_rc_muxalpha = glGetUniformLocation(s_prog, "uRcMuxAlpha");
     u_rc_stpar   = glGetUniformLocation(s_prog, "uRcStPar");
+    u_rc_bump    = glGetUniformLocation(s_prog, "uRcBump");
+    u_rc_bump_so = glGetUniformLocation(s_prog, "uRcBumpSO");
     u_rc_cin     = glGetUniformLocation(s_prog, "uRcCin");
     u_rc_ain     = glGetUniformLocation(s_prog, "uRcAin");
     u_rc_cout    = glGetUniformLocation(s_prog, "uRcCout");
@@ -782,6 +808,30 @@ static int rc_upload(const Nv2aBatch *b, const Nv2aVertex *v)
     glUniform1i(u_rc_stages, (int)n);
     glUniform1i(u_rc_muxalpha, (int)((ctl >> 8) & 1));
     glUniform1ui(u_rc_stpar, rc->stage_program);
+    {
+        /* The bump-env matrix, or identity for a stage the title never
+         * programmed: the shader always multiplies by it, and an all-zero
+         * matrix would collapse the barycentric offsets a stage-6 sample
+         * needs. Scale/offset only matter for BUMPENVMAP_LUMINANCE. */
+        float bm[4][4], so[4][2];
+        unsigned k;
+        for (k = 0; k < 4; k++) {
+            if (rc->bump_valid & (1u << k)) {
+                bm[k][0] = rc->bump_mat[k][0];
+                bm[k][1] = rc->bump_mat[k][1];
+                bm[k][2] = rc->bump_mat[k][2];
+                bm[k][3] = rc->bump_mat[k][3];
+                so[k][0] = rc->bump_scale[k];
+                so[k][1] = rc->bump_offset[k];
+            } else {
+                bm[k][0] = 1.0f; bm[k][1] = 0.0f;
+                bm[k][2] = 0.0f; bm[k][3] = 1.0f;
+                so[k][0] = 1.0f; so[k][1] = 0.0f;
+            }
+        }
+        glUniform4fv(u_rc_bump, 4, (const GLfloat *)bm);
+        glUniform2fv(u_rc_bump_so, 4, (const GLfloat *)so);
+    }
     glUniform4uiv(u_rc_cin, 8, (const GLuint *)cin);
     glUniform4uiv(u_rc_ain, 8, (const GLuint *)ain);
     glUniform2uiv(u_rc_cout, 8, (const GLuint *)cout);

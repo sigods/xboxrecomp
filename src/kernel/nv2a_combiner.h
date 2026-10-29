@@ -27,6 +27,16 @@ typedef struct {
     uint32_t final_c0, final_c1;            /* SET_SPECULAR_FOG_FACTOR */
     uint32_t control;                       /* SET_COMBINER_CONTROL */
     uint32_t stage_program;                 /* SET_SHADER_STAGE_PROGRAM */
+    /* Bump-env map, which is a *texture stage* feature the pixel shader needs
+     * anyway: SET_TEXTURE_SET_BUMP_ENV_MAT/_SCALE/_OFFSET, per stage. A stage
+     * in BUMPENVMAP mode samples its own texture at coordinates perturbed by
+     * the signed blue and green of the previous stage's texel, so without
+     * these a stage that the title programs for water or heat haze contributes
+     * nothing at all. `bump_valid` says which stages were programmed; the rest
+     * keep an identity matrix. */
+    float bump_mat[4][4];                   /* per stage: m00, m01, m10, m11 */
+    float bump_scale[4], bump_offset[4];
+    uint32_t bump_valid;
 } Nv2aCombiner;
 
 /* One pixel. Colours are r,g,b,a in [0,1]; `fog` is (fog colour, factor).
