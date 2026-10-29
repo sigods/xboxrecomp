@@ -755,6 +755,23 @@ static void dump_surface_bmp(void)
 
     if (!prefix || !w || !h || (bpp != 2 && bpp != 4) || !offset)
         return;
+    /* RECOMP_FB_DUMP_STRIDE=<n>: keep one frame in n. A menu runs at over a
+     * hundred frames a second and each BMP is most of a megabyte, so a dump
+     * left on for a whole run fills /tmp before the scene of interest arrives;
+     * the frames that are kept are still consecutive, so a fault that lasts
+     * several frames is sampled rather than skipped. */
+    {
+        static int stride = -1;
+        static unsigned seen;
+        if (stride < 0) {
+            const char *sd = getenv("RECOMP_FB_DUMP_STRIDE");
+            stride = sd ? atoi(sd) : 1;
+            if (stride < 1)
+                stride = 1;
+        }
+        if (stride > 1 && (seen++ % (unsigned)stride) != 0)
+            return;
+    }
 
     row_bytes = w * 3;
     pad = (4 - (row_bytes & 3)) & 3;
@@ -764,6 +781,12 @@ static void dump_surface_bmp(void)
     f = fopen(path, "wb");
     if (!f)
         return;
+    /* One line per frame, so a record printed by the back end (GLCOMB and
+     * friends deduplicate, so they are a set rather than a timeline) can be
+     * placed against the frame whose contents are on disk: "which batches
+     * first appeared in the frame with the white rectangle" is then a grep
+     * instead of a guess. */
+    fprintf(stderr, "[FB] frame %s %ux%u\n", path, w, h);
 
     memset(hdr, 0, sizeof hdr);
     hdr[0] = 'B'; hdr[1] = 'M';
@@ -2169,30 +2192,52 @@ static void backend_flush(int textured)
         if (s_gpu.flips != last_flips) {
             last_flips = s_gpu.flips;
             fleft = 3;
-        }
-        if (left > 0 && (long)s_gpu.batches_program >= at
+        }        if (left > 0 && (long)s_gpu.batches_program >= at
             && (fleft > 0 || s_gpu.batches_program % 211 == 0)) {
+            /* The batch's screen box. v0 alone cannot say where a batch
+             * lands, and the depth patch on the title screen is a *region*:
+             * "which batch writes depth over that rectangle" needs the box on
+             * the same line as the depth state. Computed here, where the
+             * vertices are in hand and before any of them are transformed
+             * away. */
+            float bx0 = 0, by0 = 0, bx1 = 0, by1 = 0;
+            uint32_t bi;
             if (fleft > 0)
                 fleft--;
             left--;
+            if (s_bcount) {
+                bx0 = by0 = 1e30f; bx1 = by1 = -1e30f;
+                for (bi = 0; bi < s_bcount; bi++) {
+                    float bx = s_bverts[bi].x, by = s_bverts[bi].y;
+                    if (bx != bx || by != by)
+                        continue;
+                    if (bx < bx0) bx0 = bx;
+                    if (by < by0) by0 = by;
+                    if (bx > bx1) bx1 = bx;
+                    if (by > by1) by1 = by;
+                }
+                if (bx0 > bx1) { bx0 = bx1 = by0 = by1 = 0.0f; }
+            }
             fprintf(stderr, "[GLST] batch %u flip %u n %u depth %d func %X"
                             " wmask %d | cull %d face %X front %X"
                             " | blend %d %X/%X alpha %d %X ref %u"
                             " mask %08X zfmt %X | v0 %g %g z %g rhw %g"
-                            " col %08X uv %g %g\n",
+                            " col %08X uv %g %g"
+                            " | box %.0f..%.0f %.0f..%.0f\n",
                     s_gpu.batches_program, s_gpu.flips, s_bcount,
                     rs.depth_test_enable, rs.depth_func, rs.depth_write,
                     rs.cull_enable, rs.cull_face, rs.front_face,
                     rs.blend_enable, rs.blend_src, rs.blend_dst,
-                    rs.alpha_test_enable, rs.alpha_func,
-                    rs.alpha_ref, rs.color_mask, rs.zeta_format,
+                    rs.alpha_test_enable, rs.alpha_func, rs.alpha_ref,
+                    rs.color_mask, rs.zeta_format,
                     s_bcount ? s_bverts[0].x : 0.0f,
                     s_bcount ? s_bverts[0].y : 0.0f,
                     s_bcount ? s_bverts[0].z : 0.0f,
                     s_bcount ? s_bverts[0].rhw : 0.0f,
                     s_bcount ? s_bverts[0].diffuse : 0,
                     s_bcount ? s_bverts[0].u : 0.0f,
-                    s_bcount ? s_bverts[0].v : 0.0f);
+                    s_bcount ? s_bverts[0].v : 0.0f,
+                    bx0, bx1, by0, by1);
         }
     }
     batch.vertices = s_bverts;
@@ -4120,8 +4165,46 @@ static void raster_batch(void)
     default:
         break;                             /* points and lines: not yet */
     }
-    if (backend_draws())
+    /* Everything that reaches this point took the screen-space path: the
+     * program and fixed-function batches returned above, and so did the ones
+     * that are neither. The pixel stage is where the two rasterisers part
+     * company here -- this path samples stage 0 itself or puts the vertex
+     * colour (raster_triangle evaluates no combiners), while a back end is
+     * handed `batch.combiner` whenever the title has ever programmed one
+     * (backend_flush) and runs it. A batch whose answer differs between the
+     * two is therefore always one of these, and RECOMP_GAP_LOG=<n> prints the
+     * first n of them with the state that decides the colour: the stage modes
+     * (5 bits each in SHADER_STAGE_PROGRAM), which stages hold a texture the
+     * back end will not bind because this path reported `textured` 0, and
+     * where the batch sits on screen. */
+    if (backend_draws()) {
+        static int gap_left = -1;
+        if (gap_left < 0) {
+            const char *e = getenv("RECOMP_GAP_LOG");
+            gap_left = e ? atoi(e) : 0;
+        }
+        if (gap_left > 0 && s_gpu.rc_seen) {
+            float p[4] = {0, 0, 0, 0};
+            gap_left--;
+            fetch_attr(&s_gpu.attr[0], s_gpu.idx[0], p);
+            fprintf(stderr,
+                    "  [GAP] screen-space batch %u flip %u n %u textured %d"
+                    " modes %u/%u/%u/%u texvalid %u%u%u%u"
+                    " tex0 %08X %ux%u v0 %g %g col %08X rc %u\n",
+                    s_gpu.batches_program + s_gpu.batches_ffp, s_gpu.flips,
+                    s_gpu.idx_count, textured,
+                    s_gpu.rc.stage_program & 0x1F,
+                    (s_gpu.rc.stage_program >> 5) & 0x1F,
+                    (s_gpu.rc.stage_program >> 10) & 0x1F,
+                    (s_gpu.rc.stage_program >> 15) & 0x1F,
+                    s_gpu.texs[0].valid != 0, s_gpu.texs[1].valid != 0,
+                    s_gpu.texs[2].valid != 0, s_gpu.texs[3].valid != 0,
+                    s_gpu.texs[0].offset, s_gpu.texs[0].width,
+                    s_gpu.texs[0].height, p[0], p[1],
+                    vertex_color(s_gpu.idx[0]), s_gpu.rc_seen);
+        }
         backend_flush(textured);
+    }
 
     if (s_gpu.tris_drawn && (s_gpu.tris_drawn % 500) == 0)
         fprintf(stderr, "  [GPU] %u triangles rasterised\n", s_gpu.tris_drawn);

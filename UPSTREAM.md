@@ -89,6 +89,20 @@ an ordinary clone.
   `RECOMP_GL_NO_CULL=1` restoring both on the same capture
   (`docs/BOOT_LOG.md`, 2026-10-28).
 
+- `src/kernel/nv2a_pb_exec.c` — three capture aids, all opt-in, all in the
+  executor rather than the back end:
+  - `[FB] frame <path> <w>x<h>` is printed for every frame `RECOMP_FB_DUMP`
+    writes. The back end's records deduplicate, so they are a set and not a
+    timeline; this line is what places a record against the frame on disk.
+  - `RECOMP_FB_DUMP_STRIDE=<n>` keeps one frame in n. A menu runs at over a
+    hundred frames a second and each BMP is most of a megabyte, so a dump left
+    on for a whole run fills the disk before the scene of interest arrives.
+  - `RECOMP_GAP_LOG=<n>` prints the first n screen-space batches that reach
+    `backend_flush()` with combiners seen. `raster_batch()` sends those batches
+    to `raster_triangle()`, which never evaluates the register combiners, while
+    `backend_flush()` hands every batch `s_gpu.rc` to a back end that does --
+    so this is where the two rasterisers' pixel stages part company, printed
+    with the stage modes, which stages hold a texture, and the batch's box.
 - `src/nv2a/nv2a_pb_gl.c`, `comb_report()` — the `[GLCOMB]` record now ends
   with the batch's screen box (`box x0..x1 y0..y1`) and the duplicate check
   hashes that box, quantised to 32 pixels, alongside the combiner state.
