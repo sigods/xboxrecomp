@@ -59,7 +59,7 @@ static uint32_t      s_tex_refresh;   /* frames between re-uploads, 0 = once */
 
 static GLuint s_prog;
 static GLint  u_surf, u_origin, u_incz, u_tex, u_tex1, u_tex2, u_tex3,
-              u_alphatest, u_alphafunc, u_alpharef, u_textured;
+              u_alphatest, u_alphafunc, u_alpharef, u_textured, u_alphaone;
 /* The register combiners, as uniforms: uRcCin/uRcAin hold the ICW bytes, the
  * two output registers and their flag halves, and the factors. The GLSL below
  * is nv2a_combiner.c's nv2a_rc_eval written for a fragment shader -- the same
@@ -150,6 +150,7 @@ static const char *k_fs =
     "uniform vec4 uRcFC1;\n"
     "uniform vec4 uRcFog;\n"
     "uniform int uFlat;\n"
+    "uniform int uAlphaOne;\n"
     "out vec4 frag;\n"
     /* PS_INPUTMAPPING (nv2a_combiner.c map_in). */
     "float rc_in(float x, uint byte) {\n"
@@ -322,6 +323,13 @@ static const char *k_fs =
     "        if (uTextured == 1)\n"
     "            c *= texture(uTex, vSt0.xy);\n"
     "    }\n"
+    /* RECOMP_GL_ALPHA_ONE: the ground is invisible in normal rendering yet
+     * survives FLAT's alpha test and NO_BLEND's, which is what a fragment
+     * alpha of ~0 looks like under SRC_ALPHA blending: it blends away to the
+     * backdrop. Forcing alpha to 1 here answers whether the combiner's alpha
+     * output is the gate -- colours are untouched, so a correct scene barely
+     * changes. */
+    "    if (uAlphaOne == 1) c.a = 1.0;\n"
     "    if (uAlphaTest == 1) {\n"
     "        float a = c.a;\n"
     "        int f = uAlphaFunc;\n"
@@ -405,6 +413,7 @@ static int program_build(void)
     u_rc_clip    = glGetUniformLocation(s_prog, "uRcClip");
     u_rc_fog     = glGetUniformLocation(s_prog, "uRcFog");
     u_flat       = glGetUniformLocation(s_prog, "uFlat");
+    u_alphaone   = glGetUniformLocation(s_prog, "uAlphaOne");
     return 1;
 }
 
@@ -903,6 +912,7 @@ static void state_env_init(void)
      * drawn and passes every gate -- the answer to "is the missing thing not
      * submitted, or not painted". */
     glUniform1i(u_flat, getenv("RECOMP_GL_FLAT") != NULL ? 1 : 0);
+    glUniform1i(u_alphaone, getenv("RECOMP_GL_ALPHA_ONE") != NULL ? 1 : 0);
 }
 
 static void apply_state(const Nv2aRenderState *rs, const Nv2aSurface *s,

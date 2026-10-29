@@ -349,6 +349,12 @@ static struct {
     uint32_t batches_program, verts_program, tris_behind;
     /* Where program-path triangles go, so "nothing drew" has a reason. */
     uint32_t xf_degenerate, xf_offscreen, xf_drawn;
+    /* Vertices the near clipper produced at w < 1e-2 (the w-plane clamp puts
+     * them at NV_CLIP_W=1e-3; every screen value divided by that is x1000),
+     * and clipped vertices whose window z still lands past the far plane --
+     * the two signatures of a clip that fired at the eye instead of the near
+     * plane. */
+    uint32_t xf_clip_tiny, xf_clip_zfar;
     /* Batches that reached the rasteriser and lost every triangle to the
      * three drop sites (behind the eye, degenerate, clipped) -- the flat
      * batches RECOMP_XF_FLAT reports on, counted for the census. */
@@ -3398,23 +3404,43 @@ static int xf_clip_poly(const Nv2aVshOutput *in, int n, int pl,
 static void raster_xf_clipped(const Nv2aVshOutput *a, const Nv2aVshOutput *b,
                               const Nv2aVshOutput *c)
 {
-    static int near_z = -1;
+    static int near_z = -1, zfirst = -1, zonly = -1;
     const Nv2aVshOutput *in[3];
     Nv2aVshOutput p0[8], p1[8];
-    int n = 3, i, j, pl, planes, inside = 1;
+    int n = 3, i, j, pl, npl = 0, pllist[2], inside = 1;
 
     if (near_z < 0) {
         const char *e = getenv("RECOMP_CLIP_NEAR_Z");
         near_z = !(e && e[0] == '0');
     }
-    planes = near_z ? 2 : 1;
+    if (zfirst < 0)
+        zfirst = getenv("RECOMP_CLIP_ZFIRST") != NULL;
+    if (zonly < 0)
+        zonly = getenv("RECOMP_CLIP_ZONLY") != NULL;
+    /* Plane order matters more than it looks. The w-plane cuts at
+     * NV_CLIP_W = 1e-3, i.e. essentially *at the eye*, and every screen
+     * value on such a vertex is later divided by 1e-3 (x1000). The
+     * z-plane cuts at the near plane, where w is the near distance -- a
+     * plain number. For a perspective transform w <= 0 implies z_clip < 0,
+     * so the near plane alone already removes everything behind the eye
+     * and does it where the arithmetic is stable: clip z first. */
+    if (zonly)
+        pllist[npl++] = 1;
+    else if (near_z && zfirst) {
+        pllist[npl++] = 1;
+        pllist[npl++] = 0;
+    } else if (near_z) {
+        pllist[npl++] = 0;
+        pllist[npl++] = 1;
+    } else
+        pllist[npl++] = 0;
     in[0] = a; in[1] = b; in[2] = c;
     for (i = 0; i < 3; i++) {
         p0[i] = *in[i];
         for (j = 0; j < 3; j++)
             p0[i].pos[j] = in[i]->pos[j] * in[i]->pos[3];
-        for (pl = 0; pl < planes; pl++) {
-            float d = xf_clip_dist(&p0[i], pl);
+        for (pl = 0; pl < npl; pl++) {
+            float d = xf_clip_dist(&p0[i], pllist[pl]);
             if (d != d || d - d != 0.0f)
                 return;                       /* not finite: no position at all */
             if (d < 0.0f)
@@ -3425,21 +3451,34 @@ static void raster_xf_clipped(const Nv2aVshOutput *a, const Nv2aVshOutput *b,
         raster_xf_triangle(a, b, c);
         return;
     }
-    n = xf_clip_poly(p0, n, 0, p1);
-    if (planes > 1 && n)
-        n = xf_clip_poly(p1, n, 1, p0);
-    else
+    if (npl == 2) {
+        n = xf_clip_poly(p0, n, pllist[0], p1);
+        n = xf_clip_poly(p1, n, pllist[1], p0);
+    } else {
+        n = xf_clip_poly(p0, n, pllist[0], p1);
         memcpy(p0, p1, sizeof p1);
+    }
     if (n < 3) {
         s_gpu.tris_behind++;                  /* wholly clipped away */
         s_b_fail++;
         s_b_clip++;
         return;
     }
-    /* Back to screen space: divide by the (now positive) w. */
-    for (i = 0; i < n; i++)
+    /* Back to screen space: divide by the (now positive) w. A vertex that
+     * comes out of this with a w below 1e-2 is one the w-plane clamp put at
+     * NV_CLIP_W -- its x, y and z are all x1000 too large, and z past the
+     * far plane fails every depth test. Counted, because those vertices are
+     * invisible ground slivers, not a statistical curiosity. */
+    for (i = 0; i < n; i++) {
+        if (p0[i].pos[3] < 1e-2f)
+            s_gpu.xf_clip_tiny++;
         for (j = 0; j < 3; j++)
             p0[i].pos[j] /= p0[i].pos[3];
+        /* window z is on screen only now; past the far plane it fails every
+         * depth test (LESS against a clear of 2^24). */
+        if (p0[i].pos[2] > 1.05f * 16777216.0f)
+            s_gpu.xf_clip_zfar++;
+    }
     for (i = 1; i + 1 < n; i++)
         raster_xf_triangle(&p0[0], &p0[i], &p0[i + 1]);
 }
@@ -3636,6 +3675,116 @@ static void xf_bad_report(uint32_t n)
         const float *c = nv2a_vsh_constant(i);
         fprintf(stderr, "[XFBAD]   c[%u] %g %g %g %g%s\n", i,
                 c[0], c[1], c[2], c[3], i == 112 ? "  <- MVP row (clip w)" : "");
+    }
+    /* And the dots: what clip xyzw *would* be for the bad vertex if those
+     * rows are the transform. Agreement with the program's output says the
+     * constants are what the program used (and a projection whose w straddles
+     * zero here is the title's own); disagreement says the program read other
+     * constants than these, or the interpreter computed something else. */
+    {
+        float in[4] = { 0, 0, 0, 1 };
+        if (s_gpu.attr[0].size)
+            fetch_attr(&s_gpu.attr[0], s_gpu.idx[bad], in);
+        for (i = 112; i < 116; i++) {
+            const float *c = nv2a_vsh_constant(i);
+            fprintf(stderr, "[XFBAD]   dot(v0,c[%u]) = %.6g\n", i,
+                    in[0] * c[0] + in[1] * c[1] + in[2] * c[2] + in[3] * c[3]);
+        }
+    }
+    /* The rest of the program's world: the constants it reads that are not
+     * the position matrix (c[118] is the divide's w for Otogi's terrain
+     * program; c[90]/c[94]/c[95] colour, c[158]/c[159] texcoord offset and
+     * fog), and the batch's texture/blend state -- the ground is invisible
+     * yet passes FLAT's alpha and depth gates, so what its fragments *are* is
+     * the question. */
+    {
+        static const uint32_t extra[] = { 56, 57, 58, 59, 90, 94, 95, 96,
+                                          118, 128, 133, 158, 159 };
+        for (i = 0; i < sizeof extra / sizeof extra[0]; i++) {
+            const float *c = nv2a_vsh_constant(extra[i]);
+            fprintf(stderr, "[XFBAD]   c[%u] %.6g %.6g %.6g %.6g\n",
+                    extra[i], c[0], c[1], c[2], c[3]);
+        }
+        fprintf(stderr, "[XFBAD]   blend %u %X/%X alpha %u %X ref %u"
+                        " zfunc %X zmask %u cull %u\n",
+                s_gpu.blend_enable, s_gpu.blend_sfactor, s_gpu.blend_dfactor,
+                s_gpu.alpha_test, s_gpu.alpha_func, s_gpu.alpha_ref,
+                s_gpu.depth_func, s_gpu.depth_mask, s_reg[0x0308 / 4]);
+        for (i = 0; i < 4; i++)
+            if (s_gpu.texs[i].valid)
+                fprintf(stderr, "[XFBAD]   tex%u %08X %ux%u fmt %X"
+                                " addr %X %X filter %X\n", i,
+                        s_gpu.texs[i].offset, s_gpu.texs[i].width,
+                        s_gpu.texs[i].height, s_gpu.texs[i].color,
+                        s_gpu.texs[i].addr_u, s_gpu.texs[i].addr_v,
+                        s_gpu.texs[i].filter);
+        /* What each stage's texture actually decodes to. The ground's final
+         * alpha is v0.a x t0.a, so if its DXT5 alpha plane decodes to zero
+         * the whole surface blends away and reads as the clear colour -- which
+         * is exactly what a missing ground looks like. Sample a 5x5 grid so a
+         * texture that is opaque in one corner but empty in the middle is
+         * caught too. */
+        for (i = 0; i < 4; i++) {
+            Texture saved = s_gpu.texs[0];
+            uint32_t gx, gy, px, py;
+            uint32_t amin = 0xFFFFFFFFu, amax = 0, azero = 0, an = 0;
+            uint32_t rmin = 0xFFFFFFFFu, rmax = 0;
+            if (!s_gpu.texs[i].valid)
+                continue;
+            /* sample_texture reads stage 0 (see nv2a_backend_decode_texture). */
+            s_gpu.texs[0] = s_gpu.texs[i];
+            s_gpu.texs[0].addr_u = 3; s_gpu.texs[0].addr_v = 3;
+            s_gpu.texs[0].levels = 1; s_gpu.texs[0].filter = 0;
+            s_gpu.texs[0].cube = 0; s_gpu.texs[0].valid = 1;
+            for (gy = 0; gy < 5; gy++)
+                for (gx = 0; gx < 5; gx++) {
+                    uint32_t argb;
+                    px = (gx * (s_gpu.texs[i].width  - 1)) / 4;
+                    py = (gy * (s_gpu.texs[i].height - 1)) / 4;
+                    if (!sample_texture(px, py, &argb))
+                        continue;
+                    {
+                        uint32_t av = argb >> 24, rv = (argb >> 16) & 0xFF;
+                        if (av < amin) amin = av;
+                        if (av > amax) amax = av;
+                        if (!av) azero++;
+                        if (rv < rmin) rmin = rv;
+                        if (rv > rmax) rmax = rv;
+                        an++;
+                    }
+                }
+            s_gpu.texs[0] = saved;
+            if (an)
+                fprintf(stderr, "[XFBAD]   tex%u sampled %u: alpha %u..%u"
+                                " (%u zero) red %u..%u\n", i, an, amin, amax,
+                        azero, rmin, rmax);
+        }
+        /* The combiners, word for word: the ground's fragments pass FLAT's
+         * alpha test and NO_BLEND, so what makes them alpha ~0 in normal
+         * rendering is the alpha channel through these stages. */
+        if (s_gpu.rc_seen)
+            for (i = 0; i < 4; i++)
+                fprintf(stderr, "[XFBAD]   rc st%u icw %08X/%08X ocw"
+                                " %08X/%08X f0 %08X f1 %08X\n", i,
+                        s_gpu.rc.color_icw[i], s_gpu.rc.alpha_icw[i],
+                        s_gpu.rc.color_ocw[i], s_gpu.rc.alpha_ocw[i],
+                        s_gpu.rc.factor0[i], s_gpu.rc.factor1[i]);
+        if (s_gpu.rc_seen)
+            fprintf(stderr, "[XFBAD]   rc ctl %08X stage %08X final"
+                            " %08X %08X bump %04X\n", s_gpu.rc.control,
+                    s_gpu.rc.stage_program, s_gpu.rc.final0, s_gpu.rc.final1,
+                    s_gpu.rc.bump_valid);
+        /* Which of the program's texture coordinates each stage's mode will
+         * actually sample. The terrain's stages are all BUMPENVMAP, so its
+         * texcoords come out of the bump offset, not out of an attribute. */
+        if (s_gpu.rc_seen)
+            for (i = 0; i < 4; i++)
+                fprintf(stderr, "[XFBAD]   st%u mode %u bumpmat"
+                                " %.5g %.5g %.5g %.5g so %.5g %.5g\n", i,
+                        (s_gpu.rc.stage_program >> (i * 5)) & 0x1F,
+                        s_gpu.rc.bump_mat[i][0], s_gpu.rc.bump_mat[i][1],
+                        s_gpu.rc.bump_mat[i][2], s_gpu.rc.bump_mat[i][3],
+                        s_gpu.rc.bump_scale[i], s_gpu.rc.bump_offset[i]);
     }
     nv2a_vsh_dump_current();
 }
@@ -5844,6 +5993,9 @@ void nv2a_pb_exec_report(void)
     fprintf(stderr, "[GPU] vertex programs: %u batches, %u vertices;"
                     " %u triangles dropped behind the eye\n",
             s_gpu.batches_program, s_gpu.verts_program, s_gpu.tris_behind);
+    fprintf(stderr, "[GPU] clip: %u vertices at w < 1e-2 (x/y/z x1000),"
+                    " %u clipped with z past far\n",
+            s_gpu.xf_clip_tiny, s_gpu.xf_clip_zfar);
     fprintf(stderr, "[GPU] flat batches: %u of %u lost every triangle"
                     " (%u all behind-eye, %u all degenerate, %u mixed;"
                     " %u of them on screen, RECOMP_XF_FLAT reports those)\n",
