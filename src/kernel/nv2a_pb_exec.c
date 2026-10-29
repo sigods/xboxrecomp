@@ -4951,6 +4951,26 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     case 0x1D9C:                       /* SET_CLEAR_RECT_VERTICAL */
         s_gpu.clear_rect_v = param;
         s_gpu.clear_rect_set |= 2;
+        /* Whether this title sends a clear rectangle at all decides whether
+         * one can be the rectangular patch on its title screen: the clear
+         * honours CLEAR_RECT only on a swizzled surface (see the clear path
+         * above), and a back end is not told about it either way. Printed
+         * with RECOMP_GL_STATE so an ordinary run stays quiet. */
+        {
+            static int show = -1, last_h, last_v;
+            if (show < 0)
+                show = getenv("RECOMP_GL_STATE") != NULL;
+            if (show && (param != last_v || s_gpu.clear_rect_h != last_h)) {
+                last_v = (int)param;
+                last_h = (int)s_gpu.clear_rect_h;
+                fprintf(stderr, "[GLST] clear rect %u..%u %u..%u swz %d"
+                        " set %d\n",
+                        s_gpu.clear_rect_h & 0xFFFF,
+                        (s_gpu.clear_rect_h >> 16) + 1,
+                        param & 0xFFFF, (param >> 16) + 1, s_swz_on,
+                        s_gpu.clear_rect_set);
+            }
+        }
         break;
     case NV097_SET_SURFACE_PITCH:
         s_gpu.pitch = param & 0xFFFF;      /* colour pitch; zeta is the top half */
