@@ -4098,6 +4098,89 @@ static void raster_batch(void)
     }
     if (!batch_is_screen_space()) {
         s_gpu.batches_untransformed++;
+        /* RECOMP_XF_DROP=<n>: report the first n fixed-function batches that
+         * are dropped as "not screen-space" -- the census shows tens of
+         * thousands of these on this title's stage (68,601 in a 150 s run),
+         * and they are the missing terrain: big MODE-0 meshes with no
+         * composite matrix that fail batch_is_screen_space() and are thrown
+         * away rather than transformed. What decides their fate is *why* they
+         * fail -- entirely off the surface (a real transform would bring them
+         * on) versus a span under OBJECT_SPACE_SPAN in both axes (model units,
+         * which means the title is drawing them untransformed on purpose) --
+         * and what transform context the title left behind (the composite
+         * method, and the constant file where the XF context lives: CMAT
+         * c[0..3], PMAT c[4..7], MMAT c[8..11], viewport c[58]/c[59]). */
+        {
+            static int left = -1;
+            if (left < 0) {
+                const char *e = getenv("RECOMP_XF_DROP");
+                left = e ? atoi(e) : 0;
+            }
+            if (left > 0 && s_gpu.idx_count >= 64) {
+                float p[4], lo_x, hi_x, lo_y, hi_y;
+                uint32_t i, fetchfail = 0;
+                const char *why;
+                const float *m = s_gpu.composite;
+                const float *c0 = nv2a_vsh_constant(0);
+                const float *c4 = nv2a_vsh_constant(4);
+                const float *c8 = nv2a_vsh_constant(8);
+                const float *vs = nv2a_vsh_constant(58);
+                const float *vo = nv2a_vsh_constant(59);
+
+                fetch_attr(&s_gpu.attr[0], s_gpu.idx[0], p);
+                lo_x = hi_x = p[0]; lo_y = hi_y = p[1];
+                for (i = 1; i < s_gpu.idx_count; i++) {
+                    if (!fetch_attr(&s_gpu.attr[0], s_gpu.idx[i], p)) {
+                        fetchfail = 1; break;
+                    }
+                    if (p[0] < lo_x) lo_x = p[0];
+                    if (p[0] > hi_x) hi_x = p[0];
+                    if (p[1] < lo_y) lo_y = p[1];
+                    if (p[1] > hi_y) hi_y = p[1];
+                }
+                if (fetchfail)
+                    why = "fetch-failed";
+                else if (hi_x * aa_scale_x() < (float)s_gpu.clip_x
+                      || lo_x * aa_scale_x() > (float)(s_gpu.clip_x + s_gpu.clip_w)
+                      || hi_y * aa_scale_y() < (float)s_gpu.clip_y
+                      || lo_y * aa_scale_y() > (float)(s_gpu.clip_y + s_gpu.clip_h))
+                    why = "off-surface";
+                else if (hi_x - lo_x < OBJECT_SPACE_SPAN
+                      && hi_y - lo_y < OBJECT_SPACE_SPAN)
+                    why = "object-space-span";
+                else
+                    why = "other";
+                left--;
+                fetch_attr(&s_gpu.attr[0], s_gpu.idx[0], p);
+                fprintf(stderr, "  [XFDROP] batch %u prim %u n %u mode 0x%X"
+                                " composite %d inline %d: %s"
+                                " v0 %g %g %g %g span %g x %g clip %ux%u+%u+%u"
+                                " aa %gx%g\n",
+                        s_gpu.batches_untransformed, s_gpu.prim, s_gpu.idx_count,
+                        s_gpu.xf_mode, s_gpu.composite_set, s_gpu.inline_active,
+                        why, p[0], p[1], p[2], p[3], hi_x - lo_x, hi_y - lo_y,
+                        s_gpu.clip_w, s_gpu.clip_h, s_gpu.clip_x, s_gpu.clip_y,
+                        aa_scale_x(), aa_scale_y());
+                fprintf(stderr, "  [XFDROP]   CMAT(method) %g %g %g %g | %g %g"
+                                " %g %g | %g %g %g %g | %g %g %g %g\n"
+                        "  [XFDROP]   c[0] %g %g %g %g | %g %g %g %g | %g %g"
+                                " %g %g | %g %g %g %g\n"
+                        "  [XFDROP]   c[4] %g %g %g %g | %g %g %g %g | %g %g"
+                                " %g %g | %g %g %g %g\n"
+                        "  [XFDROP]   c[8] %g %g %g %g | %g %g %g %g | %g %g"
+                                " %g %g | %g %g %g %g\n"
+                        "  [XFDROP]   VPSCL %g %g %g %g  VPOFF %g %g %g %g\n",
+                    m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7],
+                    m[8], m[9], m[10], m[11], m[12], m[13], m[14], m[15],
+                    c0[0], c0[1], c0[2], c0[3], c0[4], c0[5], c0[6], c0[7],
+                    c0[8], c0[9], c0[10], c0[11], c0[12], c0[13], c0[14], c0[15],
+                    c4[0], c4[1], c4[2], c4[3], c4[4], c4[5], c4[6], c4[7],
+                    c4[8], c4[9], c4[10], c4[11], c4[12], c4[13], c4[14], c4[15],
+                    c8[0], c8[1], c8[2], c8[3], c8[4], c8[5], c8[6], c8[7],
+                    c8[8], c8[9], c8[10], c8[11], c8[12], c8[13], c8[14], c8[15],
+                    vs[0], vs[1], vs[2], vs[3], vo[0], vo[1], vo[2], vo[3]);
+            }
+        }
         return;
     }
     /* RECOMP_BATCH_CLASS=<n>: the path the first n big batches of a run take.
