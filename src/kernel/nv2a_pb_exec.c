@@ -3540,16 +3540,26 @@ static void xf_bad_report(uint32_t n)
     static long at = -1;
     uint32_t i, bad = n, nbad = 0;
 
-    /* Only x and y: z is already depth-buffer units, and the viewport's z
-     * scale puts it in the millions (16.7M for 24-bit depth) for perfectly
-     * good vertices. w is checked because 1/w feeds every interpolation. */
-    for (i = 0; i < n; i++) {
-        const float *p = s_xf[i].pos;
-        if (!isfinite(p[0]) || !isfinite(p[1]) || !isfinite(p[3])
-            || fabsf(p[0]) > 1e6f || fabsf(p[1]) > 1e6f) {
-            if (bad == n)
-                bad = i;
-            nbad++;
+    /* x and y are checked against a pixel-sized bound; w because 1/w feeds
+     * every interpolation. z is checked too, and against a *depth* bound: the
+     * viewport's z scale is c[58].z = 2^24 for 24-bit depth, so a legitimate
+     * vertex lands its window z in [0, 2^24]. The stage's terrain reaches the
+     * rasteriser with a z around 9.9e9 -- ~589x past the far plane -- so it
+     * fails every depth test and reads as the clear colour even though it is
+     * submitted and passes cull/alpha (which is what RECOMP_GL_FLAT and
+     * RECOMP_GL_NO_BLEND show). A z far past 2^24 is a transform that was never
+     * meant to produce that depth, so it is flagged here rather than skipped. */
+    {
+        float zbound = 2.0e7f;             /* a little over the 2^24 far plane */
+        for (i = 0; i < n; i++) {
+            const float *p = s_xf[i].pos;
+            if (!isfinite(p[0]) || !isfinite(p[1]) || !isfinite(p[3])
+                || fabsf(p[0]) > 1e6f || fabsf(p[1]) > 1e6f
+                || !isfinite(p[2]) || fabsf(p[2]) > zbound) {
+                if (bad == n)
+                    bad = i;
+                nbad++;
+            }
         }
     }
     if (nbad) {
@@ -3597,6 +3607,37 @@ static void xf_bad_report(uint32_t n)
         fprintf(stderr, "[XFBAD]   out%u %g %g %g %g%s\n", i,
                 s_xf[i].pos[0], s_xf[i].pos[1], s_xf[i].pos[2],
                 s_xf[i].pos[3], i == bad ? "  <- bad" : "");
+    /* The fetched v0 and the output for the SAME consecutive vertices: this is
+     * what separates a bad input (position fetch reads the wrong index -- many
+     * vertices collapse to one, which is the "stacked" ground) from a bad
+     * transform (inputs are smooth terrain, outputs jump). The bad vertex's v0
+     * alone cannot answer it, because the report re-fetches after the batch. */
+    for (i = bad > 1 ? bad - 2 : 0; i < n && i <= bad + 2; i++) {
+        float in[4] = { 0, 0, 0, 1 };
+        if (s_gpu.attr[0].size)
+            fetch_attr(&s_gpu.attr[0], s_gpu.idx[i], in);
+        fprintf(stderr, "[XFBAD]   v0[%u] idx %u = %g %g %g %g"
+                        "  -> out %g %g %g w %g%s\n",
+                i, s_gpu.idx[i], in[0], in[1], in[2], in[3],
+                s_xf[i].pos[0], s_xf[i].pos[1], s_xf[i].pos[2], s_xf[i].pos[3],
+                i == bad ? "  <- bad" : "");
+    }
+    /* Which program drew it, and what it says: the position is wrong, so the
+     * program and its inputs are the thing to read, not just the numbers. */
+    fprintf(stderr, "[XFBAD]   z far plane c[58].z=%g c[59].z=%g"
+                    " zdiv=%u zclear=%g\n",
+            nv2a_vsh_constant(58)[2], nv2a_vsh_constant(59)[2],
+            (uint32_t)16777216u, zclear_value());
+    /* The MVP rows this program reads (clip.xyzw = dot(v0, c[112..115])): a
+     * batch whose vertices all come out behind the eye (w < 0) has a wrong or
+     * stale model-view-projection here, so print the four rows the transform
+     * actually used. */
+    for (i = 112; i < 116; i++) {
+        const float *c = nv2a_vsh_constant(i);
+        fprintf(stderr, "[XFBAD]   c[%u] %g %g %g %g%s\n", i,
+                c[0], c[1], c[2], c[3], i == 112 ? "  <- MVP row (clip w)" : "");
+    }
+    nv2a_vsh_dump_current();
 }
 
 /* RECOMP_XF_FLAT=<n>: report the first n batches that reached the
@@ -5163,6 +5204,31 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     case NV097_SET_SURFACE_COLOR_OFFSET:
         if (s_ftrace == 2)
             fprintf(stderr, "[FTRACE] color offset -> %08X%c", param, 10);
+        /* RECOMP_TGT_LOG=1: report each distinct colour offset the title
+         * renders into, once, in order. The stage's water and the movie sample
+         * a 640x480 A8R8G8B8 surface (0x80AD5000) that reads a constant grey --
+         * and the flip-time report only ever shows the two flip surfaces
+         * (0x404000 / 0x530000), so a mid-frame switch to a render-to-texture
+         * target is invisible. This answers "does the title ever draw *into*
+         * that feedback surface" in one grep: if 80AD5000 is never a target,
+         * the content has to arrive by a copy or a CPU write, not a draw. */
+        {
+            static int log_targets = -1;
+            static uint32_t seen[64]; static int nseen;
+            if (log_targets < 0)
+                log_targets = getenv("RECOMP_TGT_LOG") != NULL;
+            if (log_targets) {
+                int i, dup = 0;
+                for (i = 0; i < nseen; i++)
+                    if (seen[i] == param) { dup = 1; break; }
+                if (!dup && nseen < 64) {
+                    seen[nseen++] = param;
+                    fprintf(stderr, "  [TGT] render target #%d -> %08X"
+                            " (flip %u, batch %u)\n", nseen, param,
+                            s_gpu.flips, s_gpu.batches_program + s_gpu.batches_ffp);
+                }
+            }
+        }
         s_gpu.color_offset = param;
         break;
     case NV097_SET_COLOR_CLEAR_VALUE:
