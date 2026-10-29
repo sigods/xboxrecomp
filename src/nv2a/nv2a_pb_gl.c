@@ -1161,6 +1161,153 @@ static void comb_report(const Nv2aBatch *b, const Nv2aVertex *v)
     }
 }
 
+/* RECOMP_GL_PROBE=x,y[,n]: the draws that actually cover one pixel.
+ *
+ * The census and the combiner records say what is submitted and with what
+ * state, but a batch's screen box is not a promise about one pixel: the
+ * ground is a sheet seen at a grazing angle and its box is mostly sky. This
+ * is a point-in-triangle test against the batch's own triangles, so a pixel
+ * that reads as the clear colour gets a list of the draws that could have
+ * written it, in order, with every gate that can drop a fragment. n is how
+ * many records to print (default 40). */
+static int probe_report(const Nv2aSurface *s, const Nv2aBatch *b)
+{
+    static int px = -1, py, left, seen, minv, minflip;
+    uint32_t i;
+
+    if (px == -1) {
+        const char *e = getenv("RECOMP_GL_PROBE");
+        px = 0;
+        if (e && *e) {
+            int n = 40;
+            minv = 1;
+            minflip = 0;
+            if (sscanf(e, "%d,%d,%d,%d,%d", &px, &py, &n, &minv,
+                       &minflip) >= 2)
+                left = n;
+            else
+                px = 0;
+        }
+    }
+    if (px <= 0 || left <= 0 || b->count < (uint32_t)minv
+        || (int)s_frame < minflip)
+        return 0;
+    for (i = 0; i + 2 < b->count; i += 3) {
+        const Nv2aVertex *a = &b->vertices[i];
+        const Nv2aVertex *c = &b->vertices[i + 1];
+        const Nv2aVertex *d = &b->vertices[i + 2];
+        float x = (float)(px + (int)s->x), y = (float)(py + (int)s->y);
+        float d1, d2, d3;
+        int neg, pos;
+
+        d1 = (x - c->x) * (a->y - c->y) - (a->x - c->x) * (y - c->y);
+        d2 = (x - d->x) * (c->y - d->y) - (c->x - d->x) * (y - d->y);
+        d3 = (x - a->x) * (d->y - a->y) - (d->x - a->x) * (y - a->y);
+        if (!isfinite(d1) || !isfinite(d2) || !isfinite(d3))
+            continue;
+        neg = d1 < 0.0f || d2 < 0.0f || d3 < 0.0f;
+        pos = d1 > 0.0f || d2 > 0.0f || d3 > 0.0f;
+        if (neg && pos)
+            continue;
+        left--;
+        seen++;
+        fprintf(stderr, "[GLPROBE] #%d batch n %u tri %u flip %u"
+                        " depth %u func %X wmask %u | blend %u %X/%X"
+                        " alpha %u %X ref %u | cull %u face %X front %X"
+                        " | mask %08X | stpar %08X final %08X/%08X\n",
+                seen, b->count, i, (unsigned)s_frame,
+                b->state->depth_test_enable, b->state->depth_func,
+                b->state->depth_write,
+                b->state->blend_enable, b->state->blend_src,
+                b->state->blend_dst,
+                b->state->alpha_test_enable, b->state->alpha_func,
+                (unsigned)b->state->alpha_ref, b->state->cull_enable,
+                b->state->cull_face, b->state->front_face,
+                b->state->color_mask,
+                b->combiner ? b->combiner->stage_program : 0,
+                b->combiner ? b->combiner->final0 : 0,
+                b->combiner ? b->combiner->final1 : 0);
+        {
+            uint32_t zb;
+            memcpy(&zb, &a->z, sizeof zb);
+            fprintf(stderr, "[GLPROBE]   v0 %g %g z %g (%08X) rhw %g"
+                            " fogf %g col %08X\n",
+                    a->x, a->y, a->z, zb, a->rhw, a->fogf, a->diffuse);
+        }
+        fprintf(stderr, "[GLPROBE]   v1 %g %g z %g rhw %g | v2 %g %g z %g rhw %g\n",
+                c->x, c->y, c->z, c->rhw, d->x, d->y, d->z, d->rhw);
+        for (int st = 0; st < 4; st++) {
+            const Nv2aTexture *t = b->textures[st];
+            if (t)
+                fprintf(stderr, "[GLPROBE]   tex%d off %08X %ux%u fmt %02X"
+                                " pitch %u\n", st, t->offset, t->width,
+                        t->height, t->color, t->pitch);
+        }
+        return 1;
+    }
+    return 0;
+}
+
+/* The colour the probe pixel holds now, as the readback would see it. */
+static void probe_pixel(const char *when, const Nv2aSurface *s)
+{
+    static int px = -1, py;
+    unsigned char p[4] = {0, 0, 0, 0};
+
+    if (px < 0) {
+        const char *e = getenv("RECOMP_GL_PROBE");
+        px = 0;
+        if (e)
+            sscanf(e, "%d,%d", &px, &py);
+        if (px < 0) px = 0;
+    }
+    if (px <= 0)
+        return;
+    glReadPixels(px + (int)s->x,
+                 (GLint)s->height - 1 - (py + (int)s->y),
+                 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, p);
+    fprintf(stderr, "[GLPROBE]   %s %02X%02X%02X%02X\n", when,
+            p[0], p[1], p[2], p[3]);
+}
+
+/* Did this batch cover the probe at all? probe_report() prints when it did;
+ * the caller brackets the draw with the pixel readbacks so the record says
+ * what the batch actually changed, not only what state it was given. */
+static int probe_hit(const Nv2aSurface *s, const Nv2aBatch *b)
+{
+    static int px = -1, py;
+    uint32_t i;
+
+    if (px < 0) {
+        const char *e = getenv("RECOMP_GL_PROBE");
+        px = 0;
+        if (e)
+            sscanf(e, "%d,%d", &px, &py);
+        if (px < 0) px = 0;
+    }
+    if (px <= 0 || !b || !b->count)
+        return 0;
+    for (i = 0; i + 2 < b->count; i += 3) {
+        const Nv2aVertex *a = &b->vertices[i];
+        const Nv2aVertex *c = &b->vertices[i + 1];
+        const Nv2aVertex *d = &b->vertices[i + 2];
+        float x = (float)(px + (int)s->x), y = (float)(py + (int)s->y);
+        float d1, d2, d3;
+        int neg, pos;
+
+        d1 = (x - c->x) * (a->y - c->y) - (a->x - c->x) * (y - c->y);
+        d2 = (x - d->x) * (c->y - d->y) - (c->x - d->x) * (y - d->y);
+        d3 = (x - a->x) * (d->y - a->y) - (d->x - a->x) * (y - a->y);
+        if (!isfinite(d1) || !isfinite(d2) || !isfinite(d3))
+            continue;
+        neg = d1 < 0.0f || d2 < 0.0f || d3 < 0.0f;
+        pos = d1 > 0.0f || d2 > 0.0f || d3 > 0.0f;
+        if (!neg || !pos)
+            return 1;
+    }
+    return 0;
+}
+
 static void gl_vert_fill(GlVert *o, const Nv2aVertex *v)
 {
     int st, j;
@@ -1186,6 +1333,7 @@ static void gl_draw(const Nv2aSurface *s, const Nv2aBatch *b)
     GlTarget *t;
     size_t need, out;
     uint32_t i, dropped = 0;
+    int probe_drew = 0;
 
     if (!s_ready || !b || !b->count)
         return;
@@ -1197,6 +1345,9 @@ static void gl_draw(const Nv2aSurface *s, const Nv2aBatch *b)
     target_bind(t, s);
     apply_state(b->state, s, s_frame);
     comb_report(b, &b->vertices[0]);
+    probe_drew = probe_hit(s, b) && probe_report(s, b);
+    if (probe_drew)
+        probe_pixel("pre", s);
 
     need = b->count;
     if (need > s_verts_cap) {
@@ -1254,6 +1405,8 @@ static void gl_draw(const Nv2aSurface *s, const Nv2aBatch *b)
     rc_upload(b, &b->vertices[0]);
 
     glDrawArrays(GL_TRIANGLES, 0, (GLsizei)out);
+    if (probe_drew)
+        probe_pixel("post", s);
     s_frame_dirty = 1;
 }
 
