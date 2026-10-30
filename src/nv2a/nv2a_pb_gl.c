@@ -582,6 +582,16 @@ typedef struct {
     GLuint   tex;
     uint64_t stamp;
     uint64_t hash;        /* source bytes at last upload, 0 = unchecked */
+    /* Content checking is once per texture per frame, not once per bind.
+     * A 640x480 surface is 1.2 MB with its pitch, the movie binds one several
+     * hundred times a frame, and hashing on every bind dropped the title from
+     * 24 fps to 0.33 fps once this check was added (drw1 vs stage2,
+     * docs/BOOT_LOG.md 2026-10-30). Frame granularity is also the right one:
+     * a buffer the title rewrites -- a decoded video frame, a render surface
+     * copied back -- changes between frames, not between binds. */
+    uint32_t hash_frame;  /* frame + 1 whose bytes `live` describes (0 = never) */
+    uint64_t live;        /* hash sampled this frame */
+    uint32_t upload_frame;/* frame + 1 of the last upload (streamed sources) */
 } GlTex;
 
 #define TEX_MAX 512
@@ -757,13 +767,21 @@ static int tex_streamed(const Nv2aTexture *t)
 static int stage_bind(uint32_t unit, const Nv2aTexture *t, uint32_t frame)
 {
     GlTex *e = t ? tex_find(t) : NULL;
-    uint64_t h = 0;
+    uint32_t stamp = frame + 1;
 
     /* Streamed source: re-check the bytes behind a cached decode, so a
-     * buffer rewritten while bound is re-uploaded instead of frozen. */
+     * buffer rewritten while bound is re-uploaded instead of frozen. The
+     * hash is taken at most once per texture per frame (see GlTex), and a
+     * streamed source is re-uploaded at most once per frame for the same
+     * reason: both walk pitch*height bytes. */
     if (t && e) {
-        h = tex_source_hash(t);
-        if (h && h != e->hash)
+        if (e->hash_frame != stamp) {
+            e->hash_frame = stamp;
+            e->live = tex_source_hash(t);
+            if (!e->live)
+                e->live = 1;             /* no pitch: nothing to compare */
+        }
+        if (e->live != e->hash)
             e = NULL;                    /* content changed: re-upload */
     }
     if (s_bind_log && t)
@@ -789,12 +807,18 @@ static int stage_bind(uint32_t unit, const Nv2aTexture *t, uint32_t frame)
         e->hash = tex_source_hash(t);
         if (!e->hash)
             e->hash = 1;
-    } else if (tex_streamed(t)
+        e->live = e->hash;
+        e->hash_frame = stamp;
+        e->upload_frame = stamp;
+    } else if ((tex_streamed(t) && e->upload_frame != stamp)
                || (s_tex_refresh && frame && (frame % s_tex_refresh) == 0)) {
         tex_upload(e, t);
         e->hash = tex_source_hash(t);
         if (!e->hash)
             e->hash = 1;
+        e->live = e->hash;
+        e->hash_frame = stamp;
+        e->upload_frame = stamp;
     }
     glBindTexture(GL_TEXTURE_2D, e->tex);
     tex_params(t);
