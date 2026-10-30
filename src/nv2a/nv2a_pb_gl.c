@@ -56,6 +56,7 @@ static int           s_enabled;       /* RECOMP_PB_GL asked for it */
 static int           s_verbose;
 static uint32_t      s_zscale_override;
 static uint32_t      s_tex_refresh;   /* frames between re-uploads, 0 = once */
+static int           s_bind_log;      /* RECOMP_GL_BIND_LOG: one line per bind */
 
 static GLuint s_prog;
 static GLint  u_surf, u_origin, u_incz, u_tex, u_tex1, u_tex2, u_tex3,
@@ -580,6 +581,7 @@ typedef struct {
     uint32_t offset, w, h, fmt, levels, pitch;
     GLuint   tex;
     uint64_t stamp;
+    uint64_t hash;        /* source bytes at last upload, 0 = unchecked */
 } GlTex;
 
 #define TEX_MAX 512
@@ -613,6 +615,45 @@ static GlTex *tex_slot(void)
         glDeleteTextures(1, &victim->tex);
     memset(victim, 0, sizeof *victim);
     return victim;
+}
+
+/* Every texture whose source has a pitch is hashed: the bytes live in one
+ * contiguous pitch*height run whatever the addressing (a Morton index
+ * permutes the same run), and a title may rewrite any of them while bound --
+ * a streamed video frame, a render surface written back into a texture. The
+ * terrain's 32x64 stage-0 texture is swizzled A8R8G8B8 and was first decoded
+ * with A=0 in every texel; if a later write fills it, an upload-once cache
+ * keeps the empty alpha and the alpha test discards the whole ground. */
+
+/* FNV-1a over the texture's source bytes, word at a time. A title that
+ * rewrites a buffer while it is bound -- a decoded video frame, a render
+ * surface copied into a linear texture, a streamed mip -- is invisible to a
+ * cache keyed on offset/size/format alone: the first decode wins and every
+ * later frame shows that stale image. The XMV promo drew over itself in
+ * black every frame this way (its X8R8G8B8 quad uploaded once before the
+ * decoder's first write). Returns 0 for "nothing to hash" (no pitch, which
+ * cannot describe a linear row range) -- and 0 never matches a stored hash,
+ * because stored hashes are forced non-zero below. */
+static uint64_t tex_source_hash(const Nv2aTexture *t)
+{
+    const uint8_t *p;
+    size_t len, i;
+    uint64_t h = 0xcbf29ce484222325ULL;
+
+    if (!t->pitch || !t->height)
+        return 0;
+    len = (size_t)t->pitch * t->height;
+    if (len > (64u << 20))
+        return 0;
+    p = (const uint8_t *)xbox_GetMemoryOffset() + t->offset;
+    for (i = 0; i + 8 <= len; i += 8) {
+        uint64_t v;
+        memcpy(&v, p + i, 8);          /* alignment-agnostic */
+        h = (h ^ v) * 0x100000001b3ULL;
+    }
+    for (; i < len; i++)
+        h = (h ^ p[i]) * 0x100000001b3ULL;
+    return h ? h : 1;
 }
 
 static int tex_upload(GlTex *e, const Nv2aTexture *t)
@@ -658,6 +699,9 @@ static int tex_upload(GlTex *e, const Nv2aTexture *t)
     free(argb);
     free(rgba);
 
+    if (s_bind_log)
+        fprintf(stderr, "[PBGLU] off %08X %ux%u fmt %02X mid %08X\n",
+                t->offset, t->width, t->height, t->color, argb[n / 2]);
     e->offset = t->offset;
     e->w = t->width;
     e->h = t->height;
@@ -696,13 +740,36 @@ static void tex_params(const Nv2aTexture *t)
  * rather than an unbound GL texture. */
 static int s_stage_ok[4];
 
+/* A texture whose content the title rewrites while it is bound, so a cached
+ * decode is wrong the moment it is made. YUY2/UYVY is the decoded video frame:
+ * the movie is drawn as a quad whose texture is refilled every frame (often
+ * from a double buffer, alternating two offsets). Upload-once showed the first
+ * frame forever -- the promo stood still on the GL back end while the CPU
+ * rasteriser, which samples live memory per pixel, played it. */
+static int tex_streamed(const Nv2aTexture *t)
+{
+    return t->color == 0x24 || t->color == 0x25;   /* YUY2 / UYVY */
+}
+
 /* Bind one texture stage, uploading the texture the first time it is seen.
  * Returns 0 when there is nothing to bind (or the format cannot be decoded),
  * which the caller reports to the shader as "stage off". */
 static int stage_bind(uint32_t unit, const Nv2aTexture *t, uint32_t frame)
 {
     GlTex *e = t ? tex_find(t) : NULL;
+    uint64_t h = 0;
 
+    /* Streamed source: re-check the bytes behind a cached decode, so a
+     * buffer rewritten while bound is re-uploaded instead of frozen. */
+    if (t && e) {
+        h = tex_source_hash(t);
+        if (h && h != e->hash)
+            e = NULL;                    /* content changed: re-upload */
+    }
+    if (s_bind_log && t)
+        fprintf(stderr, "[PBGLB] f%u u%u off %08X %ux%u fmt %02X pitch %u %s\n",
+                frame, unit, t->offset, t->width, t->height, t->color,
+                t->pitch, e ? "hit" : "miss");
     glActiveTexture(GL_TEXTURE0 + unit);
     if (!t) {
         glBindTexture(GL_TEXTURE_2D, 0);
@@ -719,8 +786,15 @@ static int stage_bind(uint32_t unit, const Nv2aTexture *t, uint32_t frame)
                         t->width, t->height, t->color);
             return 0;
         }
-    } else if (s_tex_refresh && frame && (frame % s_tex_refresh) == 0) {
+        e->hash = tex_source_hash(t);
+        if (!e->hash)
+            e->hash = 1;
+    } else if (tex_streamed(t)
+               || (s_tex_refresh && frame && (frame % s_tex_refresh) == 0)) {
         tex_upload(e, t);
+        e->hash = tex_source_hash(t);
+        if (!e->hash)
+            e->hash = 1;
     }
     glBindTexture(GL_TEXTURE_2D, e->tex);
     tex_params(t);
@@ -1237,6 +1311,16 @@ static int probe_report(const Nv2aSurface *s, const Nv2aBatch *b)
                 b->combiner ? b->combiner->stage_program : 0,
                 b->combiner ? b->combiner->final0 : 0,
                 b->combiner ? b->combiner->final1 : 0);
+        if (b->combiner) {
+            const Nv2aCombiner *rc = b->combiner;
+            fprintf(stderr, "[GLPROBE]   rc ctl %08X icw0 %08X/%08X"
+                            " ocw0 %08X/%08X f0 %08X f1 %08X"
+                            " fcf %08X/%08X bump %04X\n",
+                    rc->control, rc->color_icw[0], rc->alpha_icw[0],
+                    rc->color_ocw[0], rc->alpha_ocw[0],
+                    rc->factor0[0], rc->factor1[0],
+                    rc->final_c0, rc->final_c1, rc->bump_valid);
+        }
         {
             uint32_t zb;
             memcpy(&zb, &a->z, sizeof zb);
@@ -1531,6 +1615,7 @@ int nv2a_pb_gl_init(void)
     e = getenv("RECOMP_PB_GL_ZSCALE");
     if (e && *e)
         s_zscale_override = (uint32_t)strtoul(e, NULL, 0);
+    s_bind_log = getenv("RECOMP_GL_BIND_LOG") != NULL;
     e = getenv("RECOMP_PB_GL_TEXREFRESH");
     if (e && *e)
         s_tex_refresh = (uint32_t)strtoul(e, NULL, 0);

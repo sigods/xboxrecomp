@@ -133,6 +133,22 @@ an ordinary clone.
   rectangle where the artwork should continue: Otogi's title screen, over
   PRESS START (`docs/BOOT_LOG.md`, 2026-10-28).
 
+- `src/kernel/nv2a_pb_exec.c`, census gating — `RECOMP_XF_DROP_AT=<batch id>`
+  and `RECOMP_BATCH_CLASS_AT=<batch id>` make the two "what happened to this
+  batch" reports start at a batch id, the way `RECOMP_XF_FLAT_AT` already
+  does. Both budgets are otherwise spent in a title's front end: Otogi's
+  54,193 "skipped as not screen-space" batches and the 40 `DRAW_LOG` slots
+  were both consumed before the stage was reached, so every conclusion drawn
+  from them described menus. Nothing changes unless the variables are set.
+
+- `src/kernel/nv2a_pb_exec.c`, diagnostics — `RECOMP_TEXHEX=<offset>` dumps 32
+  raw bytes at a texture's base on first decode, `RECOMP_DRAW_LOG=<offset>`
+  reports every batch binding that texture at stage 0 (path, blend, alpha
+  test, combiner words, first vertex), and the XFBAD report prints the raw
+  bytes behind a sampled texture plus constants c[0..3]. All three exist to
+  tell "the title stored zero alpha" from "the sampler read the wrong texel",
+  which a hexdump of the decoded result cannot answer. Off unless set.
+
 ## Updating
 
 The submodule tracks our fork, so a rebase is a branch operation in

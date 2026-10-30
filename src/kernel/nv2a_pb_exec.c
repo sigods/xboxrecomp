@@ -933,6 +933,32 @@ int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out)
     uint32_t x, y;
     int ok = 1;
 
+    /* RECOMP_TEXHEX=<offset>: hexdump 32 raw bytes at that texture's base on
+     * first decode -- decode-independent evidence of what the alpha channel
+     * actually holds (A8R8G8B8 alpha is byte 3 of every little-endian dword). */
+    {
+        static const char *want;
+        static int once;
+        if (!once) {
+            once = 1;
+            want = getenv("RECOMP_TEXHEX");
+        }
+        if (want && *want) {
+            unsigned long at = strtoul(want, NULL, 0);
+            if (at && tex->offset == (uint32_t)at) {
+                const uint8_t *m = (const uint8_t *)xbox_GetMemoryOffset()
+                                 + tex->offset;
+                int i;
+                fprintf(stderr, "[TEXHEX] %08X %ux%u fmt %02X pitch %u:",
+                        tex->offset, tex->width, tex->height, tex->color,
+                        tex->pitch);
+                for (i = 0; i < 32; i++)
+                    fprintf(stderr, " %02X", m[i]);
+                fprintf(stderr, "\n");
+            }
+        }
+    }
+
     s_gpu.texs[0].offset = tex->offset;
     s_gpu.texs[0].width  = tex->width;
     s_gpu.texs[0].height = tex->height;
@@ -3698,7 +3724,8 @@ static void xf_bad_report(uint32_t n)
      * yet passes FLAT's alpha and depth gates, so what its fragments *are* is
      * the question. */
     {
-        static const uint32_t extra[] = { 56, 57, 58, 59, 90, 94, 95, 96,
+        static const uint32_t extra[] = { 0, 1, 2, 3, 56, 57, 58, 59,
+                                          90, 94, 95, 96,
                                           118, 128, 133, 158, 159 };
         for (i = 0; i < sizeof extra / sizeof extra[0]; i++) {
             const float *c = nv2a_vsh_constant(extra[i]);
@@ -3754,10 +3781,24 @@ static void xf_bad_report(uint32_t n)
                     }
                 }
             s_gpu.texs[0] = saved;
-            if (an)
+            if (an) {
                 fprintf(stderr, "[XFBAD]   tex%u sampled %u: alpha %u..%u"
                                 " (%u zero) red %u..%u\n", i, an, amin, amax,
                         azero, rmin, rmax);
+                /* The bytes as stored, before any decode: if the raw alpha
+                 * byte is 0 here the data itself carries no alpha, and the
+                 * decode is exonerated; if it is 0xFF the sampler is reading
+                 * the wrong texels. First 16 bytes at the texture's base. */
+                {
+                    const uint8_t *m = (const uint8_t *)xbox_GetMemoryOffset()
+                                     + s_gpu.texs[i].offset;
+                    fprintf(stderr, "[XFBAD]   tex%u raw"
+                                    " %02X %02X %02X %02X %02X %02X %02X %02X"
+                                    " %02X %02X %02X %02X %02X %02X %02X %02X\n",
+                            i, m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7],
+                            m[8], m[9], m[10], m[11], m[12], m[13], m[14], m[15]);
+                }
+            }
         }
         /* The combiners, word for word: the ground's fragments pass FLAT's
          * alpha test and NO_BLEND, so what makes them alpha ~0 in normal
@@ -4282,6 +4323,49 @@ static void raster_batch(void)
 
     if (s_gpu.idx_count < 3)
         return;
+    /* RECOMP_DRAW_LOG=<offset>: report every batch that binds that texture at
+     * stage 0 -- its path (program / fixed-function / screen-space / dropped),
+     * blend and alpha-test state, and the combiner words that decide its
+     * fragment alpha. The terrain's 32x64 texture (0x814C2000) binds thousands
+     * of times per run yet never appeared in an XFBAD or probe report, so
+     * this is the only way to see what draws with it and with what. */
+    {
+        static const char *want;
+        static int once, left = -1;
+        if (!once) {
+            once = 1;
+            want = getenv("RECOMP_DRAW_LOG");
+            left = atoi(getenv("RECOMP_DRAW_LOG_N") ?: "40");
+        }
+        if (want && *want && left > 0 && s_gpu.texs[0].valid
+            && s_gpu.texs[0].offset == (uint32_t)strtoul(want, NULL, 0)) {
+            float p[4] = { 0, 0, 0, 1 };
+            const Nv2aCombiner *rc = s_gpu.rc_seen ? &s_gpu.rc : NULL;
+            fetch_attr(&s_gpu.attr[0], s_gpu.idx[0], p);
+            left--;
+            fprintf(stderr,
+                "  [DRAWLOG] id %u prim %u n %u mode 0x%X composite %d"
+                " inline %d: prg %d ffp %d screen %d | blend %u %X/%X"
+                " alpha %u %X ref %u z %X zmask %u"
+                " | v0 %g %g %g %g\n",
+                s_gpu.batches_program + s_gpu.batches_ffp, s_gpu.prim,
+                s_gpu.idx_count, s_gpu.xf_mode, s_gpu.composite_set,
+                s_gpu.inline_active, batch_uses_program(), batch_is_ffp(),
+                batch_is_screen_space(), s_gpu.blend_enable,
+                s_gpu.blend_sfactor, s_gpu.blend_dfactor, s_gpu.alpha_test,
+                s_gpu.alpha_func, s_gpu.alpha_ref, s_gpu.depth_func,
+                s_gpu.depth_mask, p[0], p[1], p[2], p[3]);
+            if (rc)
+                fprintf(stderr,
+                    "  [DRAWLOG]   rc ctl %08X stage %08X final %08X/%08X"
+                    " icw0 %08X/%08X ocw0 %08X/%08X f0 %08X f1 %08X\n",
+                    rc->control, rc->stage_program, rc->final0, rc->final1,
+                    rc->color_icw[0], rc->alpha_icw[0], rc->color_ocw[0],
+                    rc->alpha_ocw[0], rc->factor0[0], rc->factor1[0]);
+            else
+                fprintf(stderr, "  [DRAWLOG]   rc: none seen\n");
+        }
+    }
     if (batch_uses_program() || batch_is_ffp()) {
         raster_batch_program();
         return;
@@ -4302,11 +4386,18 @@ static void raster_batch(void)
          * c[0..3], PMAT c[4..7], MMAT c[8..11], viewport c[58]/c[59]). */
         {
             static int left = -1;
+            static long at = -1;
             if (left < 0) {
                 const char *e = getenv("RECOMP_XF_DROP");
                 left = e ? atoi(e) : 0;
+                /* RECOMP_XF_DROP_AT=<batch id>: the menu batches spend this
+                 * budget before the stage is reached, so a stage investigation
+                 * needs a starting batch id the way RECOMP_XF_FLAT_AT does. */
+                e = getenv("RECOMP_XF_DROP_AT");
+                at = e ? atol(e) : 0;
             }
-            if (left > 0 && s_gpu.idx_count >= 64) {
+            if (left > 0 && s_gpu.idx_count >= 64
+                && (long)s_gpu.batches_untransformed >= at) {
                 float p[4], lo_x, hi_x, lo_y, hi_y;
                 uint32_t i, fetchfail = 0;
                 const char *why;
@@ -4340,6 +4431,13 @@ static void raster_batch(void)
                     why = "object-space-span";
                 else
                     why = "other";
+                /* Immediate-attribute batches (fetch-failed) are menu/particle
+                 * noise that eats the budget before the stage is reached; only
+                 * the transformable-looking drops count against it. */
+                if (strcmp(why, "fetch-failed") == 0) {
+                    fprintf(stderr, "  [XFDROP] batch %u: fetch-failed (not "
+                                    "counted)\n", s_gpu.batches_untransformed);
+                } else {
                 left--;
                 fetch_attr(&s_gpu.attr[0], s_gpu.idx[0], p);
                 fprintf(stderr, "  [XFDROP] batch %u prim %u n %u mode 0x%X"
@@ -4369,6 +4467,7 @@ static void raster_batch(void)
                     c8[0], c8[1], c8[2], c8[3], c8[4], c8[5], c8[6], c8[7],
                     c8[8], c8[9], c8[10], c8[11], c8[12], c8[13], c8[14], c8[15],
                     vs[0], vs[1], vs[2], vs[3], vo[0], vo[1], vo[2], vo[3]);
+                }
             }
         }
         return;
@@ -4380,13 +4479,17 @@ static void raster_batch(void)
      * drawn at all. */
     {
         static int left = -1, minv = -1;
+        static long at = -1;
         if (left < 0) {
             const char *e = getenv("RECOMP_BATCH_CLASS");
             const char *mn = getenv("RECOMP_BATCH_CLASS_MIN");
             left = e ? atoi(e) : 0;
             minv = mn ? atoi(mn) : 256;
+            e = getenv("RECOMP_BATCH_CLASS_AT");
+            at = e ? atol(e) : 0;    /* report only from this batch id on */
         }
-        if (left > 0 && s_gpu.idx_count >= (uint32_t)(minv > 0 ? minv : 0)) {
+        if (left > 0 && s_gpu.idx_count >= (uint32_t)(minv > 0 ? minv : 0)
+            && (long)(s_gpu.batches_program + s_gpu.batches_ffp) >= at) {
             float p[4];
             left--;
             fetch_attr(&s_gpu.attr[0], s_gpu.idx[0], p);
